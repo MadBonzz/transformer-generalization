@@ -196,6 +196,7 @@ def build_single_operator_task(
 def build_range_transfer_task(
     *,
     modulus: int,
+    output_modulus: int | None = None,
     train_fraction: float,
     seed: int,
     add_offset: int = 0,
@@ -205,6 +206,7 @@ def build_range_transfer_task(
     if not 0.0 < train_fraction < 1.0:
         raise ValueError("train_fraction must be between 0 and 1")
 
+    output_modulus = modulus if output_modulus is None else output_modulus
     domain = _enumerate_domain(modulus, include_zero=include_zero)
     max_numeric_token = max(add_offset + modulus - 1, mul_offset + modulus - 1)
     add_token = max_numeric_token + 1
@@ -217,7 +219,7 @@ def build_range_transfer_task(
         for a in domain:
             for b in domain:
                 examples.append([offset + a, operator_token, offset + b, eq_token])
-                targets.append(offset + apply_operator(operator, a, b, modulus))
+                targets.append(apply_operator(operator, a, b, output_modulus))
         return examples, targets
 
     add_examples, add_targets = tokenized_examples(add_offset, "add", add_token)
@@ -248,7 +250,7 @@ def build_range_transfer_task(
 
     info = DatasetInfo(
         vocab_size=eq_token + 1,
-        target_vocab_size=max_numeric_token + 1,
+        target_vocab_size=output_modulus,
         seq_len=4,
         eq_token_id=eq_token,
         operator_token_ids={"add": add_token, "mul": mul_token},

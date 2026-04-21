@@ -6,11 +6,12 @@ import sys
 from pathlib import Path
 
 import torch
+from tqdm.auto import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from grokking_transformer.experiment_utils import RunConfig
-from grokking_transformer.job_runner import run_job_spec, write_manifest
+from grokking_transformer.job_runner import job_run_name, job_study_name, run_job_spec, write_manifest
 from grokking_transformer.logging_utils import ensure_dir
 
 
@@ -22,7 +23,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Study 3: mixed-task range transfer between modular addition and multiplication.")
     parser.add_argument("--profile", choices=("pilot", "full10"), default="pilot")
     parser.add_argument("--output-root", type=str, default="outputs/study3_range_transfer")
-    parser.add_argument("--modulus", type=int, default=251)
+    parser.add_argument("--modulus", type=int, default=251, help="Numeric input range size for the mixed-task study.")
+    parser.add_argument("--output-modulus", type=int, default=None, help="Optional output modulus. Defaults to the input modulus.")
     parser.add_argument("--train-fraction", type=float, default=None)
     parser.add_argument("--train-fractions", type=str, default="")
     parser.add_argument("--add-offset", type=int, default=0)
@@ -57,6 +59,7 @@ def defaults(profile: str) -> dict[str, object]:
 
 def build_job_specs(args: argparse.Namespace) -> list[dict[str, object]]:
     preset = defaults(args.profile)
+    output_modulus = args.modulus if args.output_modulus is None else args.output_modulus
     seeds = parse_csv_list(args.seeds, int) if args.seeds else preset["seeds"]
     if args.train_fractions:
         train_fractions = parse_csv_list(args.train_fractions, float)
@@ -91,7 +94,8 @@ def build_job_specs(args: argparse.Namespace) -> list[dict[str, object]]:
                 device=args.device,
                 output_dir=str(output_root / run_name),
                 metadata={
-                    "modulus": args.modulus,
+                    "input_modulus": args.modulus,
+                    "output_modulus": output_modulus,
                     "train_fraction": train_fraction,
                     "data_seed": 0,
                     "add_offset": args.add_offset,
@@ -104,6 +108,7 @@ def build_job_specs(args: argparse.Namespace) -> list[dict[str, object]]:
                     task_spec={
                         "kind": "range_transfer",
                         "modulus": args.modulus,
+                        "output_modulus": output_modulus,
                         "train_fraction": train_fraction,
                         "seed": 0,
                         "add_offset": args.add_offset,
@@ -154,12 +159,21 @@ def _summary_target(output_root: Path, run_name: str, manifest_mode: bool, summa
 def main() -> None:
     args = parse_args()
     jobs = build_job_specs(args)
+    study_name = job_study_name(jobs[0]) if jobs else "study3_range_transfer"
     if args.manifest_out:
         write_manifest(args.manifest_out, jobs)
+        tqdm.write(f"[MANIFEST] {study_name}: wrote {len(jobs)} runs to {args.manifest_out}")
         if args.manifest_only:
             return
-    for job in jobs:
+    tqdm.write(f"[STUDY START] {study_name}: {len(jobs)} runs -> {args.output_root}")
+    run_progress = tqdm(total=len(jobs), desc=f"{study_name} runs", unit="run", dynamic_ncols=True)
+    for run_index, job in enumerate(jobs, start=1):
+        tqdm.write(f"[RUN {run_index}/{len(jobs)} START] {job_run_name(job)}")
         run_job_spec(job)
+        run_progress.update(1)
+        tqdm.write(f"[RUN {run_index}/{len(jobs)} DONE] {job_run_name(job)}")
+    run_progress.close()
+    tqdm.write(f"[STUDY DONE] {study_name}: {len(jobs)}/{len(jobs)} runs complete")
 
 
 if __name__ == "__main__":

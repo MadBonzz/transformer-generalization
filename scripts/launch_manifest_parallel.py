@@ -9,9 +9,11 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+from tqdm.auto import tqdm
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from grokking_transformer.job_runner import aggregate_results, estimate_vram_mb, read_manifest
+from grokking_transformer.job_runner import aggregate_results, estimate_vram_mb, job_run_name, job_study_name, read_manifest
 
 
 def parse_args() -> argparse.Namespace:
@@ -87,6 +89,28 @@ def _pick_job_index(pending: list[dict[str, object]], capacity_mb: float) -> int
     return max(eligible, key=lambda index: float(pending[index]["estimated_vram_mb"]))
 
 
+def _read_progress_state(output_dir: Path) -> dict[str, object] | None:
+    progress_path = output_dir / "progress.json"
+    if not progress_path.exists():
+        return None
+    try:
+        return json.loads(progress_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return None
+
+
+def _format_running_job_status(item: dict[str, object]) -> str:
+    progress_state = _read_progress_state(Path(item["output_dir"]))
+    run_name = str(item["run_name"])
+    if progress_state is None:
+        return f"{run_name} starting"
+    step = int(progress_state.get("step", 0))
+    max_steps = int(progress_state.get("max_steps", 0))
+    if max_steps <= 0:
+        return f"{run_name} {step}"
+    return f"{run_name} {step}/{max_steps} ({100.0 * step / max_steps:.1f}%)"
+
+
 def _launch_job(
     *,
     manifest_path: Path,
@@ -98,11 +122,13 @@ def _launch_job(
     index = int(job_record["index"])
     estimated_vram_mb = float(job_record["estimated_vram_mb"])
     output_dir = Path(job["run_config"]["output_dir"])
+    run_name = job_run_name(job)
+    study_name = job_study_name(job)
     output_dir.mkdir(parents=True, exist_ok=True)
     log_path = output_dir / "launcher.log"
     log_handle = log_path.open("w", encoding="utf-8")
     process = subprocess.Popen(
-        [sys.executable, str(root / "run_experiment_job.py"), "--manifest", str(manifest_path), "--job-index", str(index)],
+        [sys.executable, "-u", str(root / "run_experiment_job.py"), "--manifest", str(manifest_path), "--job-index", str(index)],
         stdout=log_handle,
         stderr=subprocess.STDOUT,
     )
@@ -113,6 +139,8 @@ def _launch_job(
             "job_index": index,
             "estimated_vram_mb": estimated_vram_mb,
             "output_dir": str(output_dir),
+            "run_name": run_name,
+            "study_name": study_name,
             "pid": process.pid,
         },
     )
@@ -122,6 +150,8 @@ def _launch_job(
         "job_index": index,
         "estimated_vram_mb": estimated_vram_mb,
         "output_dir": str(output_dir),
+        "run_name": run_name,
+        "study_name": study_name,
     }
 
 
@@ -133,6 +163,9 @@ def main() -> None:
     event_log_path = Path(args.summary_out).parent / "scheduler_events.jsonl"
     parallel_limit = sys.maxsize if args.max_parallel <= 0 else args.max_parallel
     system_ram_supported = _query_free_system_ram_mb() is not None
+    total_jobs = len(jobs)
+    completed_jobs = 0
+    display_parallel_limit = "unbounded" if args.max_parallel <= 0 else str(args.max_parallel)
 
     pending: list[dict[str, object]] = []
     for index, job in enumerate(jobs):
@@ -147,6 +180,11 @@ def main() -> None:
     pending.sort(key=lambda item: float(item["estimated_vram_mb"]), reverse=True)
     running: list[dict[str, object]] = []
     _, total_vram_mb = _query_free_vram_mb(args.gpu_index)
+    overall_progress = tqdm(total=total_jobs, desc=f"{manifest_path.parent.name} runs", unit="run", dynamic_ncols=True)
+    tqdm.write(
+        f"[SCHEDULER START] {manifest_path.parent.name}: total_runs={total_jobs} | "
+        f"max_parallel={display_parallel_limit} | gpu_index={args.gpu_index}"
+    )
     _append_event(
         event_log_path,
         {
@@ -165,6 +203,7 @@ def main() -> None:
         },
     )
 
+    last_active_report_at = 0.0
     while pending or running:
         still_running: list[dict[str, object]] = []
         for item in running:
@@ -184,7 +223,14 @@ def main() -> None:
                 },
             )
             if return_code != 0:
+                overall_progress.close()
                 raise subprocess.CalledProcessError(return_code, item["process"].args)
+            completed_jobs += 1
+            overall_progress.update(1)
+            tqdm.write(
+                f"[DONE] {item['study_name']} | {item['run_name']} | "
+                f"completed_runs={completed_jobs}/{total_jobs}"
+            )
         running = still_running
 
         launched_any = False
@@ -250,23 +296,44 @@ def main() -> None:
                 break
 
             job_record = pending.pop(selected_index)
-            running.append(
-                _launch_job(
-                    manifest_path=manifest_path,
-                    job_record=job_record,
-                    root=root,
-                    event_log_path=event_log_path,
-                )
+            launched_job = _launch_job(
+                manifest_path=manifest_path,
+                job_record=job_record,
+                root=root,
+                event_log_path=event_log_path,
+            )
+            running.append(launched_job)
+            launched_runs = total_jobs - len(pending)
+            tqdm.write(
+                f"[LAUNCH] {launched_job['study_name']} | {launched_job['run_name']} | "
+                f"launched_runs={launched_runs}/{total_jobs} | running={len(running)} | "
+                f"est_vram={launched_job['estimated_vram_mb']:.0f}MB"
             )
             launched_any = True
             time.sleep(args.launch_settle_sec)
 
         if pending or running:
+            free_vram_mb, _ = _query_free_vram_mb(args.gpu_index)
+            overall_progress.set_postfix_str(
+                f"done={completed_jobs}/{total_jobs}, running={len(running)}, "
+                f"pending={len(pending)}, free_vram={free_vram_mb:.0f}MB"
+            )
+            if running and time.monotonic() - last_active_report_at >= max(5.0, args.poll_interval_sec):
+                active_status = "; ".join(_format_running_job_status(item) for item in running[:4])
+                if len(running) > 4:
+                    active_status += "; ..."
+                tqdm.write(
+                    f"[ACTIVE] {manifest_path.parent.name}: completed={completed_jobs}/{total_jobs} | "
+                    f"running={active_status}"
+                )
+                last_active_report_at = time.monotonic()
             if not launched_any:
                 time.sleep(args.poll_interval_sec)
 
     _append_event(event_log_path, {"event": "scheduler_end"})
     aggregate_results(manifest_path, args.summary_out)
+    overall_progress.close()
+    tqdm.write(f"[SCHEDULER DONE] {manifest_path.parent.name}: summary={args.summary_out}")
 
 
 if __name__ == "__main__":

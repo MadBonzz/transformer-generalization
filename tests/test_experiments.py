@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -8,6 +10,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from grokking_transformer.experiment_utils import RunConfig, run_training
 from grokking_transformer.mlp import MLPConfig, ModularMLP
 from grokking_transformer.model import GrokkingTransformer, TransformerConfig
 from grokking_transformer.rl import GRPOConfig, PPOConfig, grpo_update, ppo_update
@@ -34,6 +37,22 @@ class TaskBuilderTest(unittest.TestCase):
         self.assertEqual(task.info.seq_len, 4)
         self.assertTrue(task.cross_add.targets.max().item() < task.info.target_vocab_size)
         self.assertTrue(task.cross_mul.targets.max().item() < task.info.target_vocab_size)
+
+    def test_range_transfer_can_keep_input_range_and_change_output_modulus(self) -> None:
+        task = build_range_transfer_task(
+            modulus=251,
+            output_modulus=97,
+            train_fraction=0.3,
+            seed=0,
+            add_offset=0,
+            mul_offset=1000,
+        )
+        self.assertEqual(task.info.seq_len, 4)
+        self.assertEqual(task.info.target_vocab_size, 97)
+        self.assertGreater(task.info.vocab_size, task.info.target_vocab_size)
+        self.assertLess(task.train.targets.max().item(), task.info.target_vocab_size)
+        self.assertLess(task.cross_add.targets.max().item(), task.info.target_vocab_size)
+        self.assertLess(task.cross_mul.targets.max().item(), task.info.target_vocab_size)
 
 
 class GRPOSmokeTest(unittest.TestCase):
@@ -94,6 +113,48 @@ class RewardTest(unittest.TestCase):
         self.assertAlmostEqual(float(rewards[0].item()), 1.0)
         self.assertAlmostEqual(float(rewards[1].item()), 1.0 - 3.0 / 9.0)
         self.assertAlmostEqual(float(rewards[2].item()), 1.0)
+
+
+class ProgressTrackingTest(unittest.TestCase):
+    def test_run_training_writes_completed_progress_state(self) -> None:
+        task = build_single_operator_task(modulus=13, operator="add", train_fraction=0.3, seed=0)
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            run_dir = Path(tmp_dir) / "progress_run"
+            summary_csv_path = Path(tmp_dir) / "summary.csv"
+            config = RunConfig(
+                study_name="progress_test",
+                model_type="transformer",
+                objective="ce",
+                seed=0,
+                lr=1e-3,
+                weight_decay=0.0,
+                batch_size=16,
+                max_steps=2,
+                eval_every=1,
+                log_every=1,
+                device="cpu",
+                output_dir=str(run_dir),
+            )
+
+            result = run_training(
+                config=config,
+                info=task.info,
+                train_dataset=task.train,
+                eval_datasets={"train": task.train, "test": task.test},
+                summary_csv_path=summary_csv_path,
+            )
+
+            progress_path = run_dir / "progress.json"
+            self.assertTrue(progress_path.exists())
+            progress_payload = json.loads(progress_path.read_text(encoding="utf-8"))
+            self.assertEqual(progress_payload["status"], "completed")
+            self.assertEqual(progress_payload["study_name"], "progress_test")
+            self.assertEqual(progress_payload["run_name"], run_dir.name)
+            self.assertEqual(progress_payload["step"], 2)
+            self.assertEqual(progress_payload["max_steps"], 2)
+            self.assertAlmostEqual(float(progress_payload["progress_fraction"]), 1.0)
+            self.assertEqual(progress_payload["output_dir"], str(run_dir))
+            self.assertEqual(result["completed_steps"], 2)
 
 
 if __name__ == "__main__":

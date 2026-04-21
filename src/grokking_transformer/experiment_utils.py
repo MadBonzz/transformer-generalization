@@ -3,7 +3,9 @@ from __future__ import annotations
 import csv
 import math
 import random
+import time
 from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
 import torch
@@ -60,6 +62,51 @@ def build_model(model_type: str, info: DatasetInfo, mlp_hidden_dim: int) -> nn.M
 
 def parameter_count(model: nn.Module) -> int:
     return sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)
+
+
+def _timestamp_utc() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _write_progress_state(
+    *,
+    path: Path,
+    config: RunConfig,
+    run_name: str,
+    status: str,
+    step: int,
+    train_size: int,
+    steps_per_epoch: int,
+    train_loss: float | None,
+    train_metrics: dict[str, float] | None,
+    eval_metrics: dict[str, dict[str, float]] | None,
+) -> None:
+    progress_fraction = 1.0 if config.max_steps <= 0 else min(max(step / config.max_steps, 0.0), 1.0)
+    payload: dict[str, object] = {
+        "updated_at_utc": _timestamp_utc(),
+        "status": status,
+        "study_name": config.study_name,
+        "run_name": run_name,
+        "model_type": config.model_type,
+        "objective": config.objective,
+        "seed": config.seed,
+        "step": step,
+        "max_steps": config.max_steps,
+        "progress_fraction": progress_fraction,
+        "train_size": train_size,
+        "steps_per_epoch": steps_per_epoch,
+        "output_dir": str(path.parent),
+    }
+    if train_loss is not None:
+        payload["train_update_loss"] = float(train_loss)
+    if train_metrics is not None:
+        for key, value in train_metrics.items():
+            payload[f"train_{key}"] = float(value)
+    if eval_metrics is not None:
+        for split_name, split_metrics in eval_metrics.items():
+            for key, value in split_metrics.items():
+                payload[f"{split_name}_{key}"] = float(value)
+    write_json(path, payload)
 
 
 def _cuda_memory_stats(device: torch.device) -> dict[str, float]:
@@ -323,6 +370,7 @@ def run_training(
 ) -> dict[str, object]:
     set_seed(config.seed)
     output_dir = ensure_dir(config.output_dir)
+    run_name = output_dir.name
     device = torch.device(config.device)
     if device.type == "cuda" and torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats(device)
@@ -337,6 +385,7 @@ def run_training(
     train_iterator = iter(train_loader)
     metrics_path = output_dir / "metrics.jsonl"
     metrics_csv_path = output_dir / "metrics.csv"
+    progress_path = output_dir / "progress.json"
     metrics_fieldnames = _metrics_fieldnames(
         eval_split_names=sorted(eval_datasets.keys()),
         objective=config.objective,
@@ -370,85 +419,146 @@ def run_training(
 
     reference_model = create_reference_model(model) if config.objective == "grpo" and config.grpo and config.grpo.kl_coef > 0.0 else None
 
-    progress = tqdm(total=config.max_steps, desc=output_dir.name, leave=False)
+    progress = tqdm(total=config.max_steps, desc=run_name, leave=False, dynamic_ncols=True)
     final_eval: dict[str, dict[str, float]] = {}
+    step = 0
+    train_loss = float("nan")
+    train_metrics: dict[str, float] = {}
+    last_progress_write_at = 0.0
+    progress_write_interval_sec = 2.0
+    _write_progress_state(
+        path=progress_path,
+        config=config,
+        run_name=run_name,
+        status="starting",
+        step=0,
+        train_size=len(train_dataset),
+        steps_per_epoch=len(train_loader),
+        train_loss=None,
+        train_metrics=None,
+        eval_metrics=None,
+    )
 
-    for step in range(1, config.max_steps + 1):
-        try:
-            batch = next(train_iterator)
-        except StopIteration:
-            train_iterator = iter(train_loader)
-            batch = next(train_iterator)
+    try:
+        for step in range(1, config.max_steps + 1):
+            try:
+                batch = next(train_iterator)
+            except StopIteration:
+                train_iterator = iter(train_loader)
+                batch = next(train_iterator)
 
-        if config.objective == "grpo":
-            assert config.grpo is not None
-            train_metrics = grpo_update(
-                model=model,
-                batch=batch,
-                optimizer=optimizer,
-                device=device,
-                target_vocab_size=info.target_vocab_size,
-                config=config.grpo,
-                reference_model=reference_model,
-            )
-            train_loss = train_metrics["loss"]
-        elif config.objective == "ppo":
-            assert config.ppo is not None
-            assert value_head is not None
-            train_metrics = ppo_update(
-                model=model,
-                value_head=value_head,
-                batch=batch,
-                optimizer=optimizer,
-                device=device,
-                target_vocab_size=info.target_vocab_size,
-                config=config.ppo,
-            )
-            train_loss = train_metrics["loss"]
-        else:
-            train_loss = train_step(
-                model,
-                batch,
-                optimizer,
-                device,
-                target_vocab_size=info.target_vocab_size,
-                loss_type=_loss_type_for_objective(config.objective),
-            )
-            train_metrics = {"loss": train_loss}
+            if config.objective == "grpo":
+                assert config.grpo is not None
+                train_metrics = grpo_update(
+                    model=model,
+                    batch=batch,
+                    optimizer=optimizer,
+                    device=device,
+                    target_vocab_size=info.target_vocab_size,
+                    config=config.grpo,
+                    reference_model=reference_model,
+                )
+                train_loss = train_metrics["loss"]
+            elif config.objective == "ppo":
+                assert config.ppo is not None
+                assert value_head is not None
+                train_metrics = ppo_update(
+                    model=model,
+                    value_head=value_head,
+                    batch=batch,
+                    optimizer=optimizer,
+                    device=device,
+                    target_vocab_size=info.target_vocab_size,
+                    config=config.ppo,
+                )
+                train_loss = train_metrics["loss"]
+            else:
+                train_loss = train_step(
+                    model,
+                    batch,
+                    optimizer,
+                    device,
+                    target_vocab_size=info.target_vocab_size,
+                    loss_type=_loss_type_for_objective(config.objective),
+                )
+                train_metrics = {"loss": train_loss}
 
-        if step == 1 or step % config.log_every == 0 or step % config.eval_every == 0 or step == config.max_steps:
-            current_lr = float(optimizer.param_groups[0]["lr"])
-            param_norm = float(torch.sqrt(sum(parameter.detach().float().pow(2).sum() for parameter in model.parameters())).item())
-            record: dict[str, object] = {
-                "step": step,
-                "train_update_loss": train_loss,
-                "lr": current_lr,
-                "param_norm": param_norm,
-            }
-            record.update(_cuda_memory_stats(device))
-            for key, value in train_metrics.items():
-                record[f"train_{key}"] = value
+            if step == 1 or step % config.log_every == 0 or step % config.eval_every == 0 or step == config.max_steps:
+                current_lr = float(optimizer.param_groups[0]["lr"])
+                param_norm = float(torch.sqrt(sum(parameter.detach().float().pow(2).sum() for parameter in model.parameters())).item())
+                record: dict[str, object] = {
+                    "step": step,
+                    "train_update_loss": train_loss,
+                    "lr": current_lr,
+                    "param_norm": param_norm,
+                }
+                record.update(_cuda_memory_stats(device))
+                for key, value in train_metrics.items():
+                    record[f"train_{key}"] = value
 
-            if step == 1 or step % config.eval_every == 0 or step == config.max_steps:
-                final_eval = {}
-                for split_name, dataset in eval_datasets.items():
-                    split_metrics = evaluate_dataset(
-                        model=model,
-                        dataset=dataset,
-                        device=device,
-                        batch_size=config.batch_size,
-                        full_batch=config.full_batch,
-                        target_vocab_size=info.target_vocab_size,
-                        objective=config.objective,
-                    )
-                    final_eval[split_name] = split_metrics
-                    for key, value in split_metrics.items():
-                        record[f"{split_name}_{key}"] = value
+                if step == 1 or step % config.eval_every == 0 or step == config.max_steps:
+                    final_eval = {}
+                    for split_name, dataset in eval_datasets.items():
+                        split_metrics = evaluate_dataset(
+                            model=model,
+                            dataset=dataset,
+                            device=device,
+                            batch_size=config.batch_size,
+                            full_batch=config.full_batch,
+                            target_vocab_size=info.target_vocab_size,
+                            objective=config.objective,
+                        )
+                        final_eval[split_name] = split_metrics
+                        for key, value in split_metrics.items():
+                            record[f"{split_name}_{key}"] = value
 
-            append_jsonl(metrics_path, record)
-            append_csv_stable(metrics_csv_path, metrics_fieldnames, record)
+                append_jsonl(metrics_path, record)
+                append_csv_stable(metrics_csv_path, metrics_fieldnames, record)
 
-        progress.update(1)
+                postfix = {"loss": f"{train_loss:.4f}"}
+                if "test" in final_eval and "true_accuracy" in final_eval["test"]:
+                    postfix["test_acc"] = f"{final_eval['test']['true_accuracy']:.3f}"
+                elif "train" in final_eval and "true_accuracy" in final_eval["train"]:
+                    postfix["train_acc"] = f"{final_eval['train']['true_accuracy']:.3f}"
+                progress.set_postfix(postfix, refresh=False)
+
+            if (
+                step == 1
+                or step == config.max_steps
+                or step % config.log_every == 0
+                or step % config.eval_every == 0
+                or time.monotonic() - last_progress_write_at >= progress_write_interval_sec
+            ):
+                _write_progress_state(
+                    path=progress_path,
+                    config=config,
+                    run_name=run_name,
+                    status="running",
+                    step=step,
+                    train_size=len(train_dataset),
+                    steps_per_epoch=len(train_loader),
+                    train_loss=train_loss,
+                    train_metrics=train_metrics,
+                    eval_metrics=final_eval or None,
+                )
+                last_progress_write_at = time.monotonic()
+
+            progress.update(1)
+    except Exception:
+        _write_progress_state(
+            path=progress_path,
+            config=config,
+            run_name=run_name,
+            status="failed",
+            step=step,
+            train_size=len(train_dataset),
+            steps_per_epoch=len(train_loader),
+            train_loss=train_loss if not math.isnan(train_loss) else None,
+            train_metrics=train_metrics or None,
+            eval_metrics=final_eval or None,
+        )
+        progress.close()
+        raise
 
     progress.close()
     if final_only_eval_datasets is not None:
@@ -490,6 +600,18 @@ def run_training(
 
     append_csv(summary_csv_path, result)
     write_json(output_dir / "result.json", result)
+    _write_progress_state(
+        path=progress_path,
+        config=config,
+        run_name=run_name,
+        status="completed",
+        step=step,
+        train_size=len(train_dataset),
+        steps_per_epoch=len(train_loader),
+        train_loss=train_loss,
+        train_metrics=train_metrics,
+        eval_metrics=final_eval,
+    )
     for split_name, dataset in eval_datasets.items():
         export_prediction_table(
             path=output_dir / f"{split_name}_predictions.csv",

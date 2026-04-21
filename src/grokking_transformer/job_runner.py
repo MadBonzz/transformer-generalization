@@ -9,6 +9,18 @@ from .rl import GRPOConfig, PPOConfig
 from .tasks import build_range_transfer_task, build_single_operator_task
 
 
+def job_output_dir(job_spec: dict[str, object]) -> Path:
+    return Path(job_spec["run_config"]["output_dir"])
+
+
+def job_run_name(job_spec: dict[str, object]) -> str:
+    return job_output_dir(job_spec).name
+
+
+def job_study_name(job_spec: dict[str, object]) -> str:
+    return str(job_spec["run_config"]["study_name"])
+
+
 def run_job_spec(job_spec: dict[str, object]) -> dict[str, object]:
     task_spec = job_spec["task"]
     run_config = _run_config_from_dict(job_spec["run_config"])
@@ -35,6 +47,11 @@ def run_job_spec(job_spec: dict[str, object]) -> dict[str, object]:
     if task_spec["kind"] == "range_transfer":
         task = build_range_transfer_task(
             modulus=int(task_spec["modulus"]),
+            output_modulus=(
+                int(task_spec["output_modulus"])
+                if task_spec.get("output_modulus") is not None
+                else None
+            ),
             train_fraction=float(task_spec["train_fraction"]),
             seed=int(task_spec.get("seed", 0)),
             add_offset=int(task_spec["add_offset"]),
@@ -79,8 +96,9 @@ def estimate_vram_mb(job_spec: dict[str, object], per_process_overhead_mb: float
         train_size = int((modulus * modulus) * float(task_spec["train_fraction"]))
     else:
         modulus = int(task_spec["modulus"])
+        output_modulus = int(task_spec.get("output_modulus", modulus))
         seq_len = 4
-        target_vocab = max(int(task_spec["add_offset"]) + modulus - 1, int(task_spec["mul_offset"]) + modulus - 1) + 1
+        target_vocab = output_modulus
         train_size = int((2 * modulus * modulus) * float(task_spec["train_fraction"]))
 
     effective_batch = train_size if full_batch else min(batch_size, train_size)

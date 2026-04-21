@@ -6,11 +6,12 @@ import sys
 from pathlib import Path
 
 import torch
+from tqdm.auto import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from grokking_transformer.experiment_utils import RunConfig
-from grokking_transformer.job_runner import run_job_spec, write_manifest
+from grokking_transformer.job_runner import job_run_name, job_study_name, run_job_spec, write_manifest
 from grokking_transformer.logging_utils import ensure_dir
 from grokking_transformer.rl import GRPOConfig, PPOConfig
 from grokking_transformer.tasks import build_single_operator_task
@@ -346,12 +347,21 @@ def _summary_target(output_root: Path, run_name: str, manifest_mode: bool, summa
 def main() -> None:
     args = parse_args()
     jobs = build_job_specs(args)
+    study_name = job_study_name(jobs[0]) if jobs else "study1_loss_vs_rl"
     if args.manifest_out:
         write_manifest(args.manifest_out, jobs)
+        tqdm.write(f"[MANIFEST] {study_name}: wrote {len(jobs)} runs to {args.manifest_out}")
         if args.manifest_only:
             return
-    for job in jobs:
+    tqdm.write(f"[STUDY START] {study_name}: {len(jobs)} runs -> {args.output_root}")
+    run_progress = tqdm(total=len(jobs), desc=f"{study_name} runs", unit="run", dynamic_ncols=True)
+    for run_index, job in enumerate(jobs, start=1):
+        tqdm.write(f"[RUN {run_index}/{len(jobs)} START] {job_run_name(job)}")
         run_job_spec(job)
+        run_progress.update(1)
+        tqdm.write(f"[RUN {run_index}/{len(jobs)} DONE] {job_run_name(job)}")
+    run_progress.close()
+    tqdm.write(f"[STUDY DONE] {study_name}: {len(jobs)}/{len(jobs)} runs complete")
 
 
 if __name__ == "__main__":
