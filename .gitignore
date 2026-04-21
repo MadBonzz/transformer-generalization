@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+
+# Editors / OS
+.DS_Store
+Thumbs.db
+
+# Local experiment artifacts
+outputs/**/final_checkpoint.pt
+outputs/**/dataset_snapshot.pt
+outputs/**/launcher.log
+outputs/**/launcher.stdout.log
+outputs/**/launcher.stderr.log
+outputs/**/orchestrator.stdout.log
+outputs/**/orchestrator.stderr.log
+outputs/**/orchestrator.transcript.log
+outputs/**/manifest.jsonl
+outputs/**/scheduler_events.jsonl
+
+# Generic model / tensor artifacts
+*.pt
+*.pth
+*.ckpt
+
+# Keep analysis/results artifacts
+!outputs/**/
+!outputs/**/*.csv
+!outputs/**/*.json
+!outputs/**/metrics.jsonl
