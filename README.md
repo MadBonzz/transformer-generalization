@@ -53,6 +53,8 @@ chmod +x scripts/run_all_studies_a100.sh
 scripts/run_all_studies_a100.sh
 ```
 
+The repo is configured for a `uv`-managed Python 3.13 environment on Linux GPU instances.
+
 This wrapper is tuned for a `1x A100 40 GB / 16 vCPU / 112 GB RAM` box:
 
 - `PARALLEL_WORKERS=16`
