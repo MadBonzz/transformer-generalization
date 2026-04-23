@@ -6,39 +6,7 @@ from pathlib import Path
 
 from .experiment_utils import RunConfig, run_training
 from .rl import GRPOConfig, PPOConfig
-from .tasks import build_range_transfer_task, build_single_operator_task, build_study3_task
-
-
-def _study3_set_sizes(task_spec: dict[str, object]) -> tuple[int, int]:
-    modulus = int(task_spec["modulus"])
-    scenario = str(task_spec["scenario"])
-    if scenario.startswith("interleaved"):
-        chunk_size = int(task_spec.get("interleave_chunk_size", 10))
-        set_a = 0
-        set_b = 0
-        for chunk_index, start in enumerate(range(0, modulus, chunk_size)):
-            chunk_len = len(range(start, min(start + chunk_size, modulus)))
-            if chunk_index % 2 == 0:
-                set_a += chunk_len
-            else:
-                set_b += chunk_len
-        return set_a, set_b
-
-    add_size = int(task_spec.get("add_set_size", (modulus + 1) // 2))
-    return add_size, modulus - add_size
-
-
-def _study3_train_example_count(task_spec: dict[str, object]) -> int:
-    modulus = int(task_spec["modulus"])
-    scenario = str(task_spec["scenario"])
-    add_size, mul_size = _study3_set_sizes(task_spec)
-    if scenario in {"partitioned_ops", "interleaved_partitioned_ops"}:
-        return add_size * add_size + mul_size * mul_size
-    if scenario == "both_ops_within_set":
-        return 2 * (add_size * add_size + mul_size * mul_size)
-    if scenario == "both_ops_all_pairs":
-        return 2 * (modulus * modulus)
-    raise ValueError(f"unsupported Study 3 scenario={scenario}")
+from .tasks import _study3_example_count, build_range_transfer_task, build_single_operator_task, build_study3_task
 
 
 def job_output_dir(job_spec: dict[str, object]) -> Path:
@@ -160,8 +128,21 @@ def estimate_vram_mb(job_spec: dict[str, object], per_process_overhead_mb: float
         use_task_token = bool(task_spec.get("use_task_token", True))
         seq_len = 4 if use_task_token else 3
         target_vocab = output_modulus
-        train_examples = _study3_train_example_count(task_spec)
-        train_size = int(train_examples * float(task_spec["train_fraction"]))
+        scenario = str(task_spec["scenario"])
+        train_examples = _study3_example_count(
+            modulus=modulus,
+            scenario=scenario,
+            add_set_size=int(task_spec["add_set_size"]) if task_spec.get("add_set_size") is not None else None,
+            interleave_chunk_size=(
+                int(task_spec["interleave_chunk_size"])
+                if task_spec.get("interleave_chunk_size") is not None
+                else None
+            ),
+        )
+        if scenario in {"all_pairs_operator_complement", "all_pairs_pair_split_both_ops"}:
+            train_size = train_examples
+        else:
+            train_size = int(train_examples * float(task_spec["train_fraction"]))
     else:
         modulus = int(task_spec["modulus"])
         output_modulus = int(task_spec.get("output_modulus", modulus))

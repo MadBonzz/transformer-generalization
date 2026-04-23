@@ -94,6 +94,95 @@ class TaskBuilderTest(unittest.TestCase):
         self.assertNotIn((0, mul_token, 15, eq_token), reverse_mul_inputs)
         self.assertIn((0, add_token, 15, eq_token), cross_pair_add_inputs)
 
+    def test_study3_whole_set_operator_complement_swaps_operator_between_splits(self) -> None:
+        task = build_study3_task(
+            modulus=11,
+            output_modulus=11,
+            train_fraction=0.5,
+            seed=0,
+            scenario="all_pairs_operator_complement",
+            use_task_token=True,
+        )
+        eq_token = task.info.eq_token_id
+        add_token = task.info.operator_token_ids["add"]
+        mul_token = task.info.operator_token_ids["mul"]
+        train_inputs = {tuple(row.tolist()) for row in task.train.inputs}
+        test_inputs = {tuple(row.tolist()) for row in task.test.inputs}
+
+        train_add_pairs = {(row[0], row[2]) for row in train_inputs if row[1] == add_token}
+        train_mul_pairs = {(row[0], row[2]) for row in train_inputs if row[1] == mul_token}
+        test_add_pairs = {(row[0], row[2]) for row in test_inputs if row[1] == add_token}
+        test_mul_pairs = {(row[0], row[2]) for row in test_inputs if row[1] == mul_token}
+
+        self.assertEqual(len(task.train), 11 * 11)
+        self.assertEqual(len(task.test), 11 * 11)
+        self.assertEqual(train_add_pairs, test_mul_pairs)
+        self.assertEqual(train_mul_pairs, test_add_pairs)
+        self.assertEqual(train_add_pairs | train_mul_pairs, {(a, b) for a in range(11) for b in range(11)})
+        self.assertIn(eq_token, {row[3] for row in train_inputs})
+
+    def test_study3_whole_set_pair_split_keeps_pair_in_only_one_split(self) -> None:
+        task = build_study3_task(
+            modulus=11,
+            output_modulus=11,
+            train_fraction=0.5,
+            seed=0,
+            scenario="all_pairs_pair_split_both_ops",
+            use_task_token=True,
+        )
+        add_token = task.info.operator_token_ids["add"]
+        mul_token = task.info.operator_token_ids["mul"]
+        train_inputs = {tuple(row.tolist()) for row in task.train.inputs}
+        test_inputs = {tuple(row.tolist()) for row in task.test.inputs}
+
+        train_add_pairs = {(row[0], row[2]) for row in train_inputs if row[1] == add_token}
+        train_mul_pairs = {(row[0], row[2]) for row in train_inputs if row[1] == mul_token}
+        test_add_pairs = {(row[0], row[2]) for row in test_inputs if row[1] == add_token}
+        test_mul_pairs = {(row[0], row[2]) for row in test_inputs if row[1] == mul_token}
+
+        self.assertEqual(train_add_pairs, train_mul_pairs)
+        self.assertEqual(test_add_pairs, test_mul_pairs)
+        self.assertFalse(train_add_pairs & test_add_pairs)
+        self.assertEqual(train_add_pairs | test_add_pairs, {(a, b) for a in range(11) for b in range(11)})
+
+    def test_study3_four_set_missing_ops_builds_reverse_evals_and_vocab(self) -> None:
+        task = build_study3_task(
+            modulus=17,
+            output_modulus=17,
+            train_fraction=0.5,
+            seed=0,
+            scenario="four_set_missing_ops_within_set",
+            use_task_token=True,
+        )
+        self.assertEqual(task.info.seq_len, 4)
+        self.assertEqual(task.info.vocab_size, 22)
+        self.assertEqual(set(task.info.operator_token_ids), {"add", "sub", "mul", "div"})
+        self.assertIn("reverse_add", task.final_evals)
+        self.assertIn("reverse_sub", task.final_evals)
+        self.assertIn("reverse_mul", task.final_evals)
+        self.assertIn("reverse_div", task.final_evals)
+        self.assertIn("cross_pair_div", task.final_evals)
+
+    def test_study3_whole_set_scenarios_require_task_token(self) -> None:
+        with self.assertRaises(ValueError):
+            build_study3_task(
+                modulus=11,
+                output_modulus=11,
+                train_fraction=0.5,
+                seed=0,
+                scenario="all_pairs_operator_complement",
+                use_task_token=False,
+            )
+        with self.assertRaises(ValueError):
+            build_study3_task(
+                modulus=11,
+                output_modulus=11,
+                train_fraction=0.5,
+                seed=0,
+                scenario="all_pairs_pair_split_both_ops",
+                use_task_token=False,
+            )
+
 
 class GRPOSmokeTest(unittest.TestCase):
     def test_grpo_update_runs(self) -> None:
@@ -205,7 +294,7 @@ class Study3ManifestBuilderTest(unittest.TestCase):
             profile="full10",
             output_root="outputs/test_study3",
             sweep_mode="baseline_ablation",
-            scenarios="contiguous_partitioned_ops,contiguous_both_ops_within_set,contiguous_both_ops_all_pairs,contiguous_partitioned_ops_no_task_token,interleaved10_partitioned_ops,interleaved20_partitioned_ops",
+            scenarios="four_set_missing_ops_within_set,four_set_all_ops_within_set,four_set_all_ops_all_pairs,whole_set_operator_complement,whole_set_pair_split_both_ops",
             modulus=131,
             output_modulus=None,
             add_set_size=66,
@@ -227,41 +316,7 @@ class Study3ManifestBuilderTest(unittest.TestCase):
             manifest_only=False,
         )
         jobs = build_job_specs(args)
-        self.assertEqual(len(jobs), 42)
-
-    def test_only_no_task_token_ablation_disables_task_token(self) -> None:
-        args = Namespace(
-            profile="full10",
-            output_root="outputs/test_study3",
-            sweep_mode="baseline_ablation",
-            scenarios="contiguous_partitioned_ops,contiguous_partitioned_ops_no_task_token",
-            modulus=131,
-            output_modulus=None,
-            add_set_size=66,
-            train_fraction=None,
-            train_fractions="",
-            lrs="",
-            weight_decays="",
-            batch_sizes="",
-            baseline_lr=1e-3,
-            baseline_weight_decay=1.0,
-            baseline_batch_size=256,
-            baseline_train_fraction=0.5,
-            max_steps=100_000,
-            eval_every=500,
-            log_every=100,
-            device="cpu",
-            seeds="0",
-            manifest_out="",
-            manifest_only=False,
-        )
-        jobs = build_job_specs(args)
-        task_token_flags = {
-            job["run_config"]["metadata"]["scenario_name"]: job["task"]["use_task_token"]
-            for job in jobs
-        }
-        self.assertTrue(task_token_flags["contiguous_partitioned_ops"])
-        self.assertFalse(task_token_flags["contiguous_partitioned_ops_no_task_token"])
+        self.assertEqual(len(jobs), 39)
 
 
 if __name__ == "__main__":

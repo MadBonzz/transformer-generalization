@@ -26,6 +26,12 @@ outputs/**/orchestrator.stderr.log
 outputs/**/orchestrator.transcript.log
 outputs/**/manifest.jsonl
 outputs/**/scheduler_events.jsonl
+outputs/**/config.json
+outputs/**/progress.json
+outputs/**/result.json
+outputs/**/metrics.jsonl
+outputs/**/*.txt
+outputs/**/*.png
 
 # Generic model / tensor artifacts
 *.pt
@@ -35,5 +41,3 @@ outputs/**/scheduler_events.jsonl
 # Keep analysis/results artifacts
 !outputs/**/
 !outputs/**/*.csv
-!outputs/**/*.json
-!outputs/**/metrics.jsonl

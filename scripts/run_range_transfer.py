@@ -15,8 +15,15 @@ from grokking_transformer.job_runner import job_run_name, job_study_name, run_jo
 from grokking_transformer.logging_utils import ensure_dir
 
 
-BASELINE_ABLATION_SCENARIO = "contiguous_partitioned_ops"
-SCENARIO_CHOICES = (
+BASELINE_ABLATION_SCENARIO = "four_set_missing_ops_within_set"
+DEFAULT_SCENARIOS = (
+    "four_set_missing_ops_within_set",
+    "four_set_all_ops_within_set",
+    "four_set_all_ops_all_pairs",
+    "whole_set_operator_complement",
+    "whole_set_pair_split_both_ops",
+)
+ALL_SCENARIO_CHOICES = DEFAULT_SCENARIOS + (
     "contiguous_partitioned_ops",
     "contiguous_both_ops_within_set",
     "contiguous_both_ops_all_pairs",
@@ -61,6 +68,31 @@ SCENARIO_SPECS = {
         "use_task_token": False,
         "interleave_chunk_size": None,
     },
+    "whole_set_operator_complement": {
+        "task_scenario": "all_pairs_operator_complement",
+        "use_task_token": True,
+        "interleave_chunk_size": None,
+    },
+    "whole_set_pair_split_both_ops": {
+        "task_scenario": "all_pairs_pair_split_both_ops",
+        "use_task_token": True,
+        "interleave_chunk_size": None,
+    },
+    "four_set_missing_ops_within_set": {
+        "task_scenario": "four_set_missing_ops_within_set",
+        "use_task_token": True,
+        "interleave_chunk_size": None,
+    },
+    "four_set_all_ops_within_set": {
+        "task_scenario": "four_set_all_ops_within_set",
+        "use_task_token": True,
+        "interleave_chunk_size": None,
+    },
+    "four_set_all_ops_all_pairs": {
+        "task_scenario": "four_set_all_ops_all_pairs",
+        "use_task_token": True,
+        "interleave_chunk_size": None,
+    },
     "interleaved10_partitioned_ops": {
         "task_scenario": "interleaved_partitioned_ops",
         "use_task_token": True,
@@ -87,7 +119,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--profile", choices=("pilot", "full10"), default="pilot")
     parser.add_argument("--output-root", type=str, default="outputs/study3_range_transfer")
     parser.add_argument("--sweep-mode", choices=("grid", "baseline_ablation"), default="grid")
-    parser.add_argument("--scenarios", type=str, default=",".join(SCENARIO_CHOICES))
+    parser.add_argument("--scenarios", type=str, default=",".join(DEFAULT_SCENARIOS))
     parser.add_argument("--modulus", type=int, default=131)
     parser.add_argument("--output-modulus", type=int, default=None)
     parser.add_argument("--add-set-size", type=int, default=66)
@@ -238,7 +270,7 @@ def build_job_specs(args: argparse.Namespace) -> list[dict[str, object]]:
     preset = defaults(args.profile)
     seeds = parse_csv_list(args.seeds, int) if args.seeds else preset["seeds"]
     scenarios = parse_str_list(args.scenarios)
-    invalid = [scenario for scenario in scenarios if scenario not in SCENARIO_CHOICES]
+    invalid = [scenario for scenario in scenarios if scenario not in ALL_SCENARIO_CHOICES]
     if invalid:
         raise ValueError(f"unsupported Study 3 scenarios: {', '.join(invalid)}")
 

@@ -91,6 +91,10 @@ class Study3Split:
     info: DatasetInfo
 
 
+TWO_OPERATOR_SET = ("add", "mul")
+FOUR_OPERATOR_SET = ("add", "sub", "mul", "div")
+
+
 def _enumerate_domain(modulus: int, include_zero: bool) -> list[int]:
     start = 0 if include_zero else 1
     return list(range(start, modulus))
@@ -294,36 +298,164 @@ def _ordered_pairs(values_a: list[int], values_b: list[int]) -> list[tuple[int, 
     return [(a, b) for a in values_a for b in values_b]
 
 
-def _build_study3_sets(
+def _build_contiguous_n_sets(modulus: int, num_sets: int) -> list[list[int]]:
+    if num_sets <= 0:
+        raise ValueError("num_sets must be positive")
+    base_size = modulus // num_sets
+    remainder = modulus % num_sets
+    values = list(range(modulus))
+    groups: list[list[int]] = []
+    offset = 0
+    for index in range(num_sets):
+        group_size = base_size + (1 if index < remainder else 0)
+        if group_size <= 0:
+            raise ValueError("num_sets is too large for the modulus")
+        groups.append(values[offset : offset + group_size])
+        offset += group_size
+    return groups
+
+
+def _study3_operators_for_scenario(scenario: str) -> tuple[str, ...]:
+    if scenario in {
+        "partitioned_ops",
+        "interleaved_partitioned_ops",
+        "both_ops_within_set",
+        "both_ops_all_pairs",
+        "all_pairs_operator_complement",
+        "all_pairs_pair_split_both_ops",
+    }:
+        return TWO_OPERATOR_SET
+    if scenario in {
+        "four_set_missing_ops_within_set",
+        "four_set_all_ops_within_set",
+        "four_set_all_ops_all_pairs",
+    }:
+        return FOUR_OPERATOR_SET
+    raise ValueError(f"unsupported Study 3 scenario={scenario}")
+
+
+def _build_study3_groups(
     *,
     modulus: int,
     scenario: str,
     add_set_size: int | None,
     interleave_chunk_size: int | None,
-) -> tuple[list[int], list[int]]:
+) -> list[list[int]]:
+    if scenario in {"all_pairs_operator_complement", "all_pairs_pair_split_both_ops"}:
+        return [list(range(modulus))]
+    if scenario in {
+        "four_set_missing_ops_within_set",
+        "four_set_all_ops_within_set",
+        "four_set_all_ops_all_pairs",
+    }:
+        return _build_contiguous_n_sets(modulus, 4)
     if scenario.startswith("interleaved"):
         if interleave_chunk_size is None:
             raise ValueError("interleave_chunk_size is required for interleaved scenarios")
-        return _build_interleaved_sets(modulus, interleave_chunk_size)
-    return _build_contiguous_sets(modulus, add_set_size)
+        set_a, set_b = _build_interleaved_sets(modulus, interleave_chunk_size)
+        return [set_a, set_b]
+    set_a, set_b = _build_contiguous_sets(modulus, add_set_size)
+    return [set_a, set_b]
 
 
 def _build_study3_token_layout(
     *,
     modulus: int,
     use_task_token: bool,
-) -> tuple[int | None, int | None, int, int, dict[str, int]]:
+    operators: tuple[str, ...],
+) -> tuple[dict[str, int], int, int]:
     max_numeric_token = modulus - 1
     if use_task_token:
-        add_token = max_numeric_token + 1
-        mul_token = max_numeric_token + 2
-        eq_token = max_numeric_token + 3
+        operator_token_ids: dict[str, int] = {}
+        next_token_id = max_numeric_token + 1
+        for operator in operators:
+            operator_token_ids[operator] = next_token_id
+            next_token_id += 1
+        eq_token = next_token_id
         seq_len = 4
-        operator_token_ids = {"add": add_token, "mul": mul_token}
-        return add_token, mul_token, eq_token, seq_len, operator_token_ids
+        return operator_token_ids, eq_token, seq_len
 
     eq_token = max_numeric_token + 1
-    return None, None, eq_token, 3, {}
+    return {}, eq_token, 3
+
+
+def _filter_pairs_for_operator(pairs: list[tuple[int, int]], operator: str) -> list[tuple[int, int]]:
+    if operator != "div":
+        return pairs
+    return [(a, b) for a, b in pairs if b != 0]
+
+
+def _cross_pairs_across_groups(groups: list[list[int]]) -> list[tuple[int, int]]:
+    pairs: list[tuple[int, int]] = []
+    for source_index, group_a in enumerate(groups):
+        for target_index, group_b in enumerate(groups):
+            if source_index == target_index:
+                continue
+            pairs.extend(_ordered_pairs(group_a, group_b))
+    return pairs
+
+
+def _build_dataset_from_examples(
+    examples: list[list[int]],
+    targets: list[int],
+) -> TaskDataset:
+    return TaskDataset(torch.tensor(examples, dtype=torch.long), torch.tensor(targets, dtype=torch.long))
+
+
+def _split_items_evenly(
+    items: list[tuple[int, int]],
+    *,
+    train_fraction: float,
+    seed: int,
+) -> tuple[list[tuple[int, int]], list[tuple[int, int]]]:
+    generator = torch.Generator().manual_seed(seed)
+    permutation = torch.randperm(len(items), generator=generator).tolist()
+    train_size = int(len(items) * train_fraction)
+    train_items = [items[index] for index in permutation[:train_size]]
+    test_items = [items[index] for index in permutation[train_size:]]
+    return train_items, test_items
+
+
+def _study3_example_count(
+    *,
+    modulus: int,
+    scenario: str,
+    add_set_size: int | None,
+    interleave_chunk_size: int | None,
+) -> int:
+    groups = _build_study3_groups(
+        modulus=modulus,
+        scenario=scenario,
+        add_set_size=add_set_size,
+        interleave_chunk_size=interleave_chunk_size,
+    )
+    if scenario == "all_pairs_operator_complement":
+        return modulus * modulus
+    if scenario == "all_pairs_pair_split_both_ops":
+        return modulus * modulus
+
+    operators = _study3_operators_for_scenario(scenario)
+    within_group_pairs = [_ordered_pairs(group, group) for group in groups]
+    if scenario in {"partitioned_ops", "interleaved_partitioned_ops"}:
+        return len(within_group_pairs[0]) + len(within_group_pairs[1])
+    if scenario == "both_ops_within_set":
+        return sum(len(_filter_pairs_for_operator(pairs, operator)) for pairs in within_group_pairs for operator in operators)
+    if scenario == "both_ops_all_pairs":
+        all_pairs = _ordered_pairs(list(range(modulus)), list(range(modulus)))
+        return sum(len(_filter_pairs_for_operator(all_pairs, operator)) for operator in operators)
+    if scenario == "four_set_missing_ops_within_set":
+        return sum(
+            len(_filter_pairs_for_operator(within_group_pairs[group_index], operator))
+            for group_index, missing_operator in enumerate(FOUR_OPERATOR_SET)
+            for operator in FOUR_OPERATOR_SET
+            if operator != missing_operator
+        )
+    if scenario == "four_set_all_ops_within_set":
+        return sum(len(_filter_pairs_for_operator(pairs, operator)) for pairs in within_group_pairs for operator in operators)
+    if scenario == "four_set_all_ops_all_pairs":
+        all_pairs = _ordered_pairs(list(range(modulus)), list(range(modulus)))
+        return sum(len(_filter_pairs_for_operator(all_pairs, operator)) for operator in operators)
+    raise ValueError(f"unsupported Study 3 scenario={scenario}")
 
 
 def build_study3_task(
@@ -339,80 +471,167 @@ def build_study3_task(
 ) -> Study3Split:
     if not 0.0 < train_fraction < 1.0:
         raise ValueError("train_fraction must be between 0 and 1")
+    if scenario in {"all_pairs_operator_complement", "all_pairs_pair_split_both_ops"} and not math.isclose(
+        train_fraction,
+        0.5,
+        rel_tol=0.0,
+        abs_tol=1e-9,
+    ):
+        raise ValueError(f"{scenario} requires train_fraction=0.5")
 
     output_modulus = modulus if output_modulus is None else output_modulus
-    set_a, set_b = _build_study3_sets(
+    groups = _build_study3_groups(
         modulus=modulus,
         scenario=scenario,
         add_set_size=add_set_size,
         interleave_chunk_size=interleave_chunk_size,
     )
-    add_token, mul_token, eq_token, seq_len, operator_token_ids = _build_study3_token_layout(
+    operators = _study3_operators_for_scenario(scenario)
+    operator_token_ids, eq_token, seq_len = _build_study3_token_layout(
         modulus=modulus,
         use_task_token=use_task_token,
+        operators=operators,
     )
 
     def encode_example(a: int, b: int, operator: str) -> list[int]:
         if use_task_token:
-            operator_token = add_token if operator == "add" else mul_token
-            assert operator_token is not None
-            return [a, operator_token, b, eq_token]
+            return [a, operator_token_ids[operator], b, eq_token]
         return [a, b, eq_token]
 
     def make_dataset_from_pairs(pairs: list[tuple[int, int]], operator: str) -> TaskDataset:
-        examples = [encode_example(a, b, operator) for a, b in pairs]
-        targets = [apply_operator(operator, a, b, output_modulus) for a, b in pairs]
-        return TaskDataset(torch.tensor(examples, dtype=torch.long), torch.tensor(targets, dtype=torch.long))
+        filtered_pairs = _filter_pairs_for_operator(pairs, operator)
+        examples = [encode_example(a, b, operator) for a, b in filtered_pairs]
+        targets = [apply_operator(operator, a, b, output_modulus) for a, b in filtered_pairs]
+        return _build_dataset_from_examples(examples, targets)
 
     train_examples: list[list[int]] = []
     train_targets: list[int] = []
 
     def append_examples(pairs: list[tuple[int, int]], operator: str) -> None:
-        for a, b in pairs:
+        for a, b in _filter_pairs_for_operator(pairs, operator):
             train_examples.append(encode_example(a, b, operator))
             train_targets.append(apply_operator(operator, a, b, output_modulus))
-
-    aa_pairs = _ordered_pairs(set_a, set_a)
-    bb_pairs = _ordered_pairs(set_b, set_b)
-    ab_pairs = _ordered_pairs(set_a, set_b)
-    ba_pairs = _ordered_pairs(set_b, set_a)
-    cross_pairs = ab_pairs + ba_pairs
+    
+    within_group_pairs = [_ordered_pairs(group, group) for group in groups]
+    cross_pairs = _cross_pairs_across_groups(groups)
     all_values = list(range(modulus))
     all_pairs = _ordered_pairs(all_values, all_values)
 
     if scenario in {"partitioned_ops", "interleaved_partitioned_ops"}:
-        append_examples(aa_pairs, "add")
-        append_examples(bb_pairs, "mul")
+        add_group_pairs = within_group_pairs[0]
+        mul_group_pairs = within_group_pairs[1]
+        append_examples(add_group_pairs, "add")
+        append_examples(mul_group_pairs, "mul")
         final_evals = {
-            "reverse_add": make_dataset_from_pairs(bb_pairs, "add"),
-            "reverse_mul": make_dataset_from_pairs(aa_pairs, "mul"),
+            "reverse_add": make_dataset_from_pairs(mul_group_pairs, "add"),
+            "reverse_mul": make_dataset_from_pairs(add_group_pairs, "mul"),
             "cross_pair_add": make_dataset_from_pairs(cross_pairs, "add"),
             "cross_pair_mul": make_dataset_from_pairs(cross_pairs, "mul"),
         }
+        inputs, labels, train_idx, test_idx = _make_inputs(train_examples, train_targets, train_fraction=train_fraction, seed=seed)
+        train = TaskDataset(inputs[train_idx], labels[train_idx], true_targets=labels[train_idx])
+        test = TaskDataset(inputs[test_idx], labels[test_idx], true_targets=labels[test_idx])
     elif scenario == "both_ops_within_set":
-        append_examples(aa_pairs, "add")
-        append_examples(aa_pairs, "mul")
-        append_examples(bb_pairs, "add")
-        append_examples(bb_pairs, "mul")
+        for pairs in within_group_pairs:
+            for operator in TWO_OPERATOR_SET:
+                append_examples(pairs, operator)
         final_evals = {
             "cross_pair_add": make_dataset_from_pairs(cross_pairs, "add"),
             "cross_pair_mul": make_dataset_from_pairs(cross_pairs, "mul"),
         }
+        inputs, labels, train_idx, test_idx = _make_inputs(train_examples, train_targets, train_fraction=train_fraction, seed=seed)
+        train = TaskDataset(inputs[train_idx], labels[train_idx], true_targets=labels[train_idx])
+        test = TaskDataset(inputs[test_idx], labels[test_idx], true_targets=labels[test_idx])
     elif scenario == "both_ops_all_pairs":
         if not use_task_token:
             raise ValueError("both_ops_all_pairs requires use_task_token=True because add and mul labels would collide")
-        append_examples(all_pairs, "add")
-        append_examples(all_pairs, "mul")
+        for operator in TWO_OPERATOR_SET:
+            append_examples(all_pairs, operator)
         final_evals = {
             "cross_pair_add": make_dataset_from_pairs(cross_pairs, "add"),
             "cross_pair_mul": make_dataset_from_pairs(cross_pairs, "mul"),
         }
+        inputs, labels, train_idx, test_idx = _make_inputs(train_examples, train_targets, train_fraction=train_fraction, seed=seed)
+        train = TaskDataset(inputs[train_idx], labels[train_idx], true_targets=labels[train_idx])
+        test = TaskDataset(inputs[test_idx], labels[test_idx], true_targets=labels[test_idx])
+    elif scenario == "all_pairs_operator_complement":
+        if not use_task_token:
+            raise ValueError("all_pairs_operator_complement requires use_task_token=True because task identity must be explicit")
+        train_pairs, test_pairs = _split_items_evenly(all_pairs, train_fraction=train_fraction, seed=seed)
+        train_examples = [encode_example(a, b, "add") for a, b in train_pairs] + [encode_example(a, b, "mul") for a, b in test_pairs]
+        train_targets = [apply_operator("add", a, b, output_modulus) for a, b in train_pairs] + [
+            apply_operator("mul", a, b, output_modulus) for a, b in test_pairs
+        ]
+        test_examples = [encode_example(a, b, "mul") for a, b in train_pairs] + [encode_example(a, b, "add") for a, b in test_pairs]
+        test_targets = [apply_operator("mul", a, b, output_modulus) for a, b in train_pairs] + [
+            apply_operator("add", a, b, output_modulus) for a, b in test_pairs
+        ]
+        train = _build_dataset_from_examples(train_examples, train_targets)
+        test = _build_dataset_from_examples(test_examples, test_targets)
+        final_evals = {}
+    elif scenario == "all_pairs_pair_split_both_ops":
+        if not use_task_token:
+            raise ValueError("all_pairs_pair_split_both_ops requires use_task_token=True because both operators appear for the same pair")
+        train_pairs, test_pairs = _split_items_evenly(all_pairs, train_fraction=train_fraction, seed=seed)
+        train_examples = []
+        train_targets = []
+        test_examples = []
+        test_targets = []
+        for operator in TWO_OPERATOR_SET:
+            train_examples.extend(encode_example(a, b, operator) for a, b in _filter_pairs_for_operator(train_pairs, operator))
+            train_targets.extend(apply_operator(operator, a, b, output_modulus) for a, b in _filter_pairs_for_operator(train_pairs, operator))
+            test_examples.extend(encode_example(a, b, operator) for a, b in _filter_pairs_for_operator(test_pairs, operator))
+            test_targets.extend(apply_operator(operator, a, b, output_modulus) for a, b in _filter_pairs_for_operator(test_pairs, operator))
+        train = _build_dataset_from_examples(train_examples, train_targets)
+        test = _build_dataset_from_examples(test_examples, test_targets)
+        final_evals = {}
+    elif scenario == "four_set_missing_ops_within_set":
+        if not use_task_token:
+            raise ValueError("four_set_missing_ops_within_set requires use_task_token=True because three operators are trained per set")
+        withheld_by_group = list(FOUR_OPERATOR_SET)
+        for group_index, pairs in enumerate(within_group_pairs):
+            withheld_operator = withheld_by_group[group_index]
+            for operator in FOUR_OPERATOR_SET:
+                if operator == withheld_operator:
+                    continue
+                append_examples(pairs, operator)
+        final_evals = {
+            f"reverse_{operator}": make_dataset_from_pairs(within_group_pairs[group_index], operator)
+            for group_index, operator in enumerate(FOUR_OPERATOR_SET)
+        }
+        for operator in FOUR_OPERATOR_SET:
+            final_evals[f"cross_pair_{operator}"] = make_dataset_from_pairs(cross_pairs, operator)
+        inputs, labels, train_idx, test_idx = _make_inputs(train_examples, train_targets, train_fraction=train_fraction, seed=seed)
+        train = TaskDataset(inputs[train_idx], labels[train_idx], true_targets=labels[train_idx])
+        test = TaskDataset(inputs[test_idx], labels[test_idx], true_targets=labels[test_idx])
+    elif scenario == "four_set_all_ops_within_set":
+        if not use_task_token:
+            raise ValueError("four_set_all_ops_within_set requires use_task_token=True because four operators are trained per set")
+        for pairs in within_group_pairs:
+            for operator in FOUR_OPERATOR_SET:
+                append_examples(pairs, operator)
+        final_evals = {
+            f"cross_pair_{operator}": make_dataset_from_pairs(cross_pairs, operator)
+            for operator in FOUR_OPERATOR_SET
+        }
+        inputs, labels, train_idx, test_idx = _make_inputs(train_examples, train_targets, train_fraction=train_fraction, seed=seed)
+        train = TaskDataset(inputs[train_idx], labels[train_idx], true_targets=labels[train_idx])
+        test = TaskDataset(inputs[test_idx], labels[test_idx], true_targets=labels[test_idx])
+    elif scenario == "four_set_all_ops_all_pairs":
+        if not use_task_token:
+            raise ValueError("four_set_all_ops_all_pairs requires use_task_token=True because four operators are trained over all pairs")
+        for operator in FOUR_OPERATOR_SET:
+            append_examples(all_pairs, operator)
+        final_evals = {
+            f"cross_pair_{operator}": make_dataset_from_pairs(cross_pairs, operator)
+            for operator in FOUR_OPERATOR_SET
+        }
+        inputs, labels, train_idx, test_idx = _make_inputs(train_examples, train_targets, train_fraction=train_fraction, seed=seed)
+        train = TaskDataset(inputs[train_idx], labels[train_idx], true_targets=labels[train_idx])
+        test = TaskDataset(inputs[test_idx], labels[test_idx], true_targets=labels[test_idx])
     else:
         raise ValueError(f"unsupported Study 3 scenario={scenario}")
 
-    inputs, labels, train_idx, test_idx = _make_inputs(train_examples, train_targets, train_fraction=train_fraction, seed=seed)
-    train = TaskDataset(inputs[train_idx], labels[train_idx], true_targets=labels[train_idx])
-    test = TaskDataset(inputs[test_idx], labels[test_idx], true_targets=labels[test_idx])
     info = DatasetInfo(
         vocab_size=eq_token + 1,
         target_vocab_size=output_modulus,
