@@ -1,0 +1,5 @@
+outputs/
+*.pt
+*.pth
+*.ckpt
+__pycache__/

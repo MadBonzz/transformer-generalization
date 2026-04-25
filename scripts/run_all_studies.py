@@ -13,6 +13,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--profile", choices=("pilot", "full10"), default="pilot")
     parser.add_argument("--output-root", type=str, default="outputs")
     parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--transformer-layers", type=int, choices=(1, 2), default=1)
     parser.add_argument("--studies", type=str, default="", help="Comma-separated subset of studies: study1,study2,study3")
     parser.add_argument("--seeds", type=str, default="", help="Optional comma-separated seed list passed through to each study.")
     parser.add_argument("--max-steps", type=int, default=None, help="Optional max-steps override applied to all selected studies.")
@@ -107,6 +108,8 @@ def main() -> None:
                 str(study["output_root"]),
                 "--device",
                 args.device,
+                "--transformer-layers",
+                str(args.transformer_layers),
                 "--max-steps",
                 str(study["max_steps"]),
             ]
@@ -128,6 +131,8 @@ def main() -> None:
             str(study["output_root"]),
             "--device",
             args.device,
+            "--transformer-layers",
+            str(args.transformer_layers),
             "--max-steps",
             str(study["max_steps"]),
             "--manifest-out",

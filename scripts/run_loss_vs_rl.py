@@ -10,7 +10,12 @@ from tqdm.auto import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from grokking_transformer.experiment_utils import RunConfig
+from grokking_transformer.experiment_utils import (
+    RunConfig,
+    run_config_payload,
+    transformer_architecture_name,
+    transformer_run_prefix,
+)
 from grokking_transformer.job_runner import job_run_name, job_study_name, run_job_spec, write_manifest
 from grokking_transformer.logging_utils import ensure_dir
 from grokking_transformer.rl import GRPOConfig, PPOConfig
@@ -33,6 +38,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-every", type=int, default=200)
     parser.add_argument("--log-every", type=int, default=50)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--transformer-layers", type=int, choices=(1, 2), default=1)
     parser.add_argument("--ce-lrs", type=str, default="")
     parser.add_argument("--ce-batch-sizes", type=str, default="")
     parser.add_argument("--ce-weight-decays", type=str, default="")
@@ -102,6 +108,8 @@ def build_job_specs(args: argparse.Namespace) -> list[dict[str, object]]:
     summary_csv = output_root / "summary.csv"
     manifest_mode = bool(args.manifest_out)
     jobs: list[dict[str, object]] = []
+    transformer_prefix = transformer_run_prefix(args.transformer_layers)
+    transformer_architecture = transformer_architecture_name(args.transformer_layers)
 
     for train_fraction in train_fractions:
         task = build_single_operator_task(
@@ -114,7 +122,7 @@ def build_job_specs(args: argparse.Namespace) -> list[dict[str, object]]:
         for model_type in ("transformer", "mlp"):
             if model_type == "transformer":
                 for seed, lr, batch_size, weight_decay in itertools.product(seeds, ce_lrs, ce_batch_sizes, ce_weight_decays):
-                    run_name = f"transformer_tf{train_fraction}_ce_seed{seed}_lr{lr}_wd{weight_decay}_bs{batch_size}"
+                    run_name = f"{transformer_prefix}_tf{train_fraction}_ce_seed{seed}_lr{lr}_wd{weight_decay}_bs{batch_size}"
                     config = RunConfig(
                         study_name="study1_loss_vs_rl",
                         model_type="transformer",
@@ -128,6 +136,7 @@ def build_job_specs(args: argparse.Namespace) -> list[dict[str, object]]:
                         log_every=args.log_every,
                         device=args.device,
                         output_dir=str(output_root / run_name),
+                        transformer_n_layers=args.transformer_layers,
                         metadata={
                             "operator": args.operator,
                             "modulus": args.modulus,
@@ -137,6 +146,8 @@ def build_job_specs(args: argparse.Namespace) -> list[dict[str, object]]:
                             "include_zero": True,
                             "reward_mode": "",
                             "n_samples": 0,
+                            "transformer_n_layers": args.transformer_layers,
+                            "transformer_architecture": transformer_architecture,
                         },
                     )
                     jobs.append(
@@ -165,7 +176,7 @@ def build_job_specs(args: argparse.Namespace) -> list[dict[str, object]]:
                     ("binary", "binary_plus_partial_absolute"),
                 ):
                     run_name = (
-                        f"transformer_tf{train_fraction}_grpo_{reward_mode}_seed{seed}_lr{lr}_wd{weight_decay}"
+                        f"{transformer_prefix}_tf{train_fraction}_grpo_{reward_mode}_seed{seed}_lr{lr}_wd{weight_decay}"
                         f"_bs{batch_size}_ns{n_samples}"
                     )
                     config = RunConfig(
@@ -181,6 +192,7 @@ def build_job_specs(args: argparse.Namespace) -> list[dict[str, object]]:
                         log_every=args.log_every,
                         device=args.device,
                         output_dir=str(output_root / run_name),
+                        transformer_n_layers=args.transformer_layers,
                         metadata={
                             "operator": args.operator,
                             "modulus": args.modulus,
@@ -190,6 +202,8 @@ def build_job_specs(args: argparse.Namespace) -> list[dict[str, object]]:
                             "include_zero": True,
                             "reward_mode": reward_mode,
                             "n_samples": n_samples,
+                            "transformer_n_layers": args.transformer_layers,
+                            "transformer_architecture": transformer_architecture,
                         },
                         grpo=GRPOConfig(n_samples=n_samples, reward_mode=reward_mode, clip_eps=0.2, policy_epochs=4, entropy_coef=1e-3),
                     )
@@ -313,25 +327,7 @@ def build_job_specs(args: argparse.Namespace) -> list[dict[str, object]]:
 def make_job_spec(config: RunConfig, task_spec: dict[str, object], summary_csv_path: Path) -> dict[str, object]:
     return {
         "task": task_spec,
-        "run_config": {
-            "study_name": config.study_name,
-            "model_type": config.model_type,
-            "objective": config.objective,
-            "seed": config.seed,
-            "lr": config.lr,
-            "weight_decay": config.weight_decay,
-            "batch_size": config.batch_size,
-            "max_steps": config.max_steps,
-            "eval_every": config.eval_every,
-            "log_every": config.log_every,
-            "device": config.device,
-            "output_dir": config.output_dir,
-            "full_batch": config.full_batch,
-            "mlp_hidden_dim": config.mlp_hidden_dim,
-            "metadata": config.metadata,
-            "grpo": config.grpo.to_dict() if config.grpo is not None else None,
-            "ppo": config.ppo.to_dict() if config.ppo is not None else None,
-        },
+        "run_config": run_config_payload(config),
         "summary_csv_path": str(summary_csv_path),
     }
 

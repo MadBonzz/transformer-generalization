@@ -23,6 +23,23 @@ class GrokkingTransformerSmokeTest(unittest.TestCase):
         logits = model(tokens)
         self.assertEqual(tuple(logits.shape), (2, 114))
 
+    def test_neel_one_layer_preset_uses_relu_without_layernorm(self) -> None:
+        model = GrokkingTransformer(TransformerConfig.neel_nanda(vocab_size=114, seq_len=3))
+        self.assertTrue(any(isinstance(module, torch.nn.ReLU) for module in model.modules()))
+        self.assertFalse(any(isinstance(module, torch.nn.LayerNorm) for module in model.modules()))
+
+    def test_power_two_layer_preset_has_layernorm_and_sinusoidal_positions(self) -> None:
+        model = GrokkingTransformer(TransformerConfig.power_grokking(vocab_size=114, seq_len=5))
+        self.assertTrue(any(isinstance(module, torch.nn.LayerNorm) for module in model.modules()))
+        self.assertFalse(isinstance(model.pos_embed, torch.nn.Parameter))
+
+    def test_two_layer_forward_shape(self) -> None:
+        config = TransformerConfig.power_grokking(vocab_size=114, seq_len=3)
+        model = GrokkingTransformer(config)
+        tokens = torch.tensor([[1, 2, 113], [5, 7, 113]], dtype=torch.long)
+        logits = model(tokens)
+        self.assertEqual(tuple(logits.shape), (2, 114))
+
     def test_small_batch_can_overfit(self) -> None:
         torch.manual_seed(0)
         train_split, _ = create_data_splits(prime=13, train_fraction=0.25, seed=0)

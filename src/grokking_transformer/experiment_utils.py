@@ -37,9 +37,53 @@ class RunConfig:
     output_dir: str
     full_batch: bool = False
     mlp_hidden_dim: int = 512
+    transformer_n_layers: int = 1
+    checkpoint_every_steps: int | None = None
+    checkpoint_steps: tuple[int, ...] | None = None
     metadata: dict[str, object] | None = None
     grpo: GRPOConfig | None = None
     ppo: PPOConfig | None = None
+
+
+def transformer_run_prefix(transformer_n_layers: int) -> str:
+    if transformer_n_layers == 1:
+        return "transformer"
+    if transformer_n_layers == 2:
+        return "transformer2"
+    raise ValueError("transformer_n_layers must be 1 or 2")
+
+
+def transformer_architecture_name(transformer_n_layers: int) -> str:
+    if transformer_n_layers == 1:
+        return "neel_nanda_1layer"
+    if transformer_n_layers == 2:
+        return "power_etal_2layer"
+    raise ValueError("transformer_n_layers must be 1 or 2")
+
+
+def run_config_payload(config: RunConfig) -> dict[str, object]:
+    return {
+        "study_name": config.study_name,
+        "model_type": config.model_type,
+        "objective": config.objective,
+        "seed": config.seed,
+        "lr": config.lr,
+        "weight_decay": config.weight_decay,
+        "batch_size": config.batch_size,
+        "max_steps": config.max_steps,
+        "eval_every": config.eval_every,
+        "log_every": config.log_every,
+        "device": config.device,
+        "output_dir": config.output_dir,
+        "full_batch": config.full_batch,
+        "mlp_hidden_dim": config.mlp_hidden_dim,
+        "transformer_n_layers": config.transformer_n_layers,
+        "checkpoint_every_steps": config.checkpoint_every_steps,
+        "checkpoint_steps": config.checkpoint_steps,
+        "metadata": config.metadata,
+        "grpo": config.grpo.to_dict() if config.grpo is not None else None,
+        "ppo": config.ppo.to_dict() if config.ppo is not None else None,
+    }
 
 
 def set_seed(seed: int) -> None:
@@ -49,15 +93,26 @@ def set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-def build_model(model_type: str, info: DatasetInfo, mlp_hidden_dim: int) -> nn.Module:
-    if model_type == "transformer":
-        config = TransformerConfig(vocab_size=info.vocab_size, seq_len=info.seq_len)
-        return GrokkingTransformer(config)
-    if model_type == "mlp":
+def build_model(config: RunConfig, info: DatasetInfo) -> nn.Module:
+    if config.model_type == "transformer":
+        if config.transformer_n_layers == 1:
+            transformer_config = TransformerConfig.neel_nanda(
+                vocab_size=info.vocab_size,
+                seq_len=info.seq_len,
+            )
+        elif config.transformer_n_layers == 2:
+            transformer_config = TransformerConfig.power_grokking(
+                vocab_size=info.vocab_size,
+                seq_len=info.seq_len,
+            )
+        else:
+            raise ValueError("transformer_n_layers must be 1 or 2")
+        return GrokkingTransformer(transformer_config)
+    if config.model_type == "mlp":
         if info.seq_len != 3:
             raise ValueError("the MLP runner only supports single-operator tasks with seq_len=3")
-        return ModularMLP(MLPConfig(prime=info.target_vocab_size, hidden_dim=mlp_hidden_dim))
-    raise ValueError(f"unsupported model_type={model_type}")
+        return ModularMLP(MLPConfig(prime=info.target_vocab_size, hidden_dim=config.mlp_hidden_dim))
+    raise ValueError(f"unsupported model_type={config.model_type}")
 
 
 def parameter_count(model: nn.Module) -> int:
@@ -295,7 +350,9 @@ def save_checkpoint(
         "value_head_state_dict": value_head.state_dict() if value_head is not None else None,
         "result": result,
     }
-    torch.save(checkpoint, Path(path))
+    checkpoint_path = Path(path)
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(checkpoint, checkpoint_path)
 
 
 def _loss_type_for_objective(objective: str) -> str:
@@ -310,6 +367,12 @@ def _loss_type_for_objective(objective: str) -> str:
     if objective == "ppo":
         return "cross_entropy"
     raise ValueError(f"unsupported objective={objective}")
+
+
+def _should_save_periodic_checkpoint(config: RunConfig, step: int) -> bool:
+    if config.checkpoint_steps is not None:
+        return step in config.checkpoint_steps
+    return config.checkpoint_every_steps is not None and step % config.checkpoint_every_steps == 0
 
 
 def _make_optimizer(parameters, config: RunConfig) -> torch.optim.Optimizer:
@@ -374,7 +437,7 @@ def run_training(
     device = torch.device(config.device)
     if device.type == "cuda" and torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats(device)
-    model = build_model(config.model_type, info, config.mlp_hidden_dim).to(device)
+    model = build_model(config, info).to(device)
     value_head: nn.Module | None = None
     if config.objective == "ppo":
         value_head = nn.Linear(info.target_vocab_size, 1).to(device)
@@ -542,6 +605,31 @@ def run_training(
                     eval_metrics=final_eval or None,
                 )
                 last_progress_write_at = time.monotonic()
+
+            if _should_save_periodic_checkpoint(config, step):
+                checkpoint_result = {
+                    "study_name": config.study_name,
+                    "model_type": config.model_type,
+                    "objective": config.objective,
+                    "seed": config.seed,
+                    "lr": config.lr,
+                    "weight_decay": config.weight_decay,
+                    "batch_size": config.batch_size,
+                    "max_steps": config.max_steps,
+                    "completed_steps": step,
+                    "output_dir": str(output_dir),
+                    "checkpoint_path": str(output_dir / "checkpoints" / f"step_{step:06d}.pt"),
+                }
+                if config.metadata is not None:
+                    checkpoint_result.update(config.metadata)
+                save_checkpoint(
+                    path=output_dir / "checkpoints" / f"step_{step:06d}.pt",
+                    model=model,
+                    optimizer=optimizer,
+                    value_head=value_head,
+                    step=step,
+                    result=checkpoint_result,
+                )
 
             progress.update(1)
     except Exception:

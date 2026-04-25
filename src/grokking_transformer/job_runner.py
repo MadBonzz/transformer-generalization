@@ -155,7 +155,15 @@ def estimate_vram_mb(job_spec: dict[str, object], per_process_overhead_mb: float
     if model_type == "transformer":
         d_model = 128
         d_mlp = 512
-        activation_mb = 4.0 * effective_batch * seq_len * (6 * d_model + 2 * d_mlp + target_vocab) / (1024 ** 2)
+        transformer_n_layers = int(run_config.get("transformer_n_layers", 1))
+        activation_mb = (
+            4.0
+            * effective_batch
+            * seq_len
+            * transformer_n_layers
+            * (6 * d_model + 2 * d_mlp + target_vocab)
+            / (1024 ** 2)
+        )
         rl_extra = 0.0
         if objective == "grpo":
             n_samples = int(run_config["grpo"]["n_samples"])
@@ -231,6 +239,7 @@ def _run_config_from_dict(payload: dict[str, object]) -> RunConfig:
         output_dir=str(payload["output_dir"]),
         full_batch=bool(payload.get("full_batch", False)),
         mlp_hidden_dim=int(payload.get("mlp_hidden_dim", 512)),
+        transformer_n_layers=int(payload.get("transformer_n_layers", 1)),
         metadata=payload.get("metadata"),
         grpo=grpo,
         ppo=ppo,

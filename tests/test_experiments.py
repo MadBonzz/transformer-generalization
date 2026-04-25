@@ -311,6 +311,7 @@ class Study3ManifestBuilderTest(unittest.TestCase):
             eval_every=500,
             log_every=100,
             device="cpu",
+            transformer_layers=1,
             seeds="",
             manifest_out="",
             manifest_only=False,

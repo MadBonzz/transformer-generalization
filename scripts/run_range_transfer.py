@@ -10,7 +10,12 @@ from tqdm.auto import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from grokking_transformer.experiment_utils import RunConfig
+from grokking_transformer.experiment_utils import (
+    RunConfig,
+    run_config_payload,
+    transformer_architecture_name,
+    transformer_run_prefix,
+)
 from grokking_transformer.job_runner import job_run_name, job_study_name, run_job_spec, write_manifest
 from grokking_transformer.logging_utils import ensure_dir
 
@@ -136,6 +141,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-every", type=int, default=500)
     parser.add_argument("--log-every", type=int, default=100)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--transformer-layers", type=int, choices=(1, 2), default=1)
     parser.add_argument("--seeds", type=str, default="")
     parser.add_argument("--manifest-out", type=str, default="")
     parser.add_argument("--manifest-only", action="store_true")
@@ -232,6 +238,7 @@ def _metadata_payload(
     output_modulus: int,
     train_fraction: float,
     add_set_size: int,
+    transformer_layers: int,
 ) -> dict[str, object]:
     return {
         "scenario_name": scenario_name,
@@ -243,6 +250,8 @@ def _metadata_payload(
         "add_set_size": add_set_size,
         "use_task_token": scenario_spec["use_task_token"],
         "interleave_chunk_size": scenario_spec["interleave_chunk_size"],
+        "transformer_n_layers": transformer_layers,
+        "transformer_architecture": transformer_architecture_name(transformer_layers),
     }
 
 
@@ -286,7 +295,8 @@ def build_job_specs(args: argparse.Namespace) -> list[dict[str, object]]:
         candidate_points = _scenario_candidate_points(scenario_name, args=args, preset=preset)
         for lr, weight_decay, batch_size, train_fraction in candidate_points:
             for seed in seeds:
-                run_name = f"transformer_tf{train_fraction}_ce_seed{seed}_lr{lr}_wd{weight_decay}_bs{batch_size}"
+                run_prefix = transformer_run_prefix(args.transformer_layers)
+                run_name = f"{run_prefix}_tf{train_fraction}_ce_seed{seed}_lr{lr}_wd{weight_decay}_bs{batch_size}"
                 config = RunConfig(
                     study_name="study3_range_transfer",
                     model_type="transformer",
@@ -300,6 +310,7 @@ def build_job_specs(args: argparse.Namespace) -> list[dict[str, object]]:
                     log_every=args.log_every,
                     device=args.device,
                     output_dir=str(scenario_root / run_name),
+                    transformer_n_layers=args.transformer_layers,
                     metadata=_metadata_payload(
                         scenario_name=scenario_name,
                         scenario_spec=scenario_spec,
@@ -307,6 +318,7 @@ def build_job_specs(args: argparse.Namespace) -> list[dict[str, object]]:
                         output_modulus=output_modulus,
                         train_fraction=train_fraction,
                         add_set_size=args.add_set_size,
+                        transformer_layers=args.transformer_layers,
                     ),
                 )
                 jobs.append(
@@ -328,25 +340,7 @@ def build_job_specs(args: argparse.Namespace) -> list[dict[str, object]]:
 def make_job_spec(config: RunConfig, task_spec: dict[str, object], summary_csv_path: Path) -> dict[str, object]:
     return {
         "task": task_spec,
-        "run_config": {
-            "study_name": config.study_name,
-            "model_type": config.model_type,
-            "objective": config.objective,
-            "seed": config.seed,
-            "lr": config.lr,
-            "weight_decay": config.weight_decay,
-            "batch_size": config.batch_size,
-            "max_steps": config.max_steps,
-            "eval_every": config.eval_every,
-            "log_every": config.log_every,
-            "device": config.device,
-            "output_dir": config.output_dir,
-            "full_batch": config.full_batch,
-            "mlp_hidden_dim": config.mlp_hidden_dim,
-            "metadata": config.metadata,
-            "grpo": None,
-            "ppo": None,
-        },
+        "run_config": run_config_payload(config),
         "summary_csv_path": str(summary_csv_path),
     }
 
