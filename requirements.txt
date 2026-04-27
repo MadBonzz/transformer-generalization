@@ -1,0 +1,13 @@
+# Python >= 3.13
+#
+# PyTorch CUDA 12.8 wheels are resolved from the PyTorch index.
+# For a CPU-only environment, remove the +cu128 suffixes and this extra index.
+--extra-index-url https://download.pytorch.org/whl/cu128
+
+torch==2.11.0+cu128
+torchvision==0.26.0+cu128
+tqdm==4.67.3
+matplotlib==3.10.8
+
+# Used by scripts/analyze_study3_embeddings.py.
+scikit-learn

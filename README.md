@@ -17,8 +17,9 @@ This project includes:
 ## Quick start
 
 ```powershell
-uv venv .venv
-uv sync
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install --upgrade pip
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
 .\.venv\Scripts\python.exe -m unittest discover -s tests -v
 .\.venv\Scripts\python.exe train.py --steps 200 --device cuda
 .\.venv\Scripts\python.exe train.py --model mlp --steps 200 --full-batch --device cuda
@@ -53,7 +54,7 @@ chmod +x scripts/run_all_studies_a100.sh
 scripts/run_all_studies_a100.sh
 ```
 
-The repo is configured for a `uv`-managed Python 3.13 environment on Linux GPU instances.
+The repo is configured for a Python 3.13 environment with dependencies installed from `requirements.txt`.
 
 This wrapper is tuned for a `1x A100 40 GB / 16 vCPU / 112 GB RAM` box:
 
