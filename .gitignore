@@ -16,6 +16,8 @@ venv/
 Thumbs.db
 
 # Local experiment artifacts
+**/*output*/
+**/*output*/**
 outputs/**/final_checkpoint.pt
 outputs/**/dataset_snapshot.pt
 outputs/**/launcher.log
@@ -38,6 +40,4 @@ outputs/**/*.png
 *.pth
 *.ckpt
 
-# Keep analysis/results artifacts
-!outputs/**/
-!outputs/**/*.csv
+# Output archives are intentionally kept out of new commits by default.

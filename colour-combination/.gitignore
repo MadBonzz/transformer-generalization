@@ -1,4 +1,8 @@
 outputs/
+extracted_base_case_outputs/
+*.tar
+*.tar.gz
+*.tgz
 *.pt
 *.pth
 *.ckpt

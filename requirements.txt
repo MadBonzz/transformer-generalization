@@ -8,6 +8,9 @@ torch==2.11.0+cu128
 torchvision==0.26.0+cu128
 tqdm==4.67.3
 matplotlib==3.10.8
+numpy
+pandas
+pymixbox==2.0.0
 
 # Used by scripts/analyze_study3_embeddings.py.
 scikit-learn
