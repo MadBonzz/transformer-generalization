@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import subprocess
 import sys
@@ -12,6 +13,13 @@ from tqdm.auto import tqdm
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 DEFAULT_OUTPUT_ROOT = ROOT_DIR / "outputs" / "colour_reaction_12runs"
+REQUIRED_MODULES = {
+    "torch": "torch",
+    "tqdm": "tqdm",
+    "numpy": "numpy",
+    "pandas": "pandas",
+    "mixbox": "pymixbox",
+}
 
 
 def parse_args() -> argparse.Namespace:
@@ -45,6 +53,24 @@ def split_workers(total_workers: int) -> tuple[int, int]:
     if total_workers >= 12:
         return 6, 6
     return colour_workers, reaction_workers
+
+
+def check_required_modules() -> None:
+    missing_packages = [
+        package_name
+        for module_name, package_name in REQUIRED_MODULES.items()
+        if importlib.util.find_spec(module_name) is None
+    ]
+    if missing_packages:
+        packages = " ".join(dict.fromkeys(missing_packages))
+        raise SystemExit(
+            "Missing required Python packages: "
+            f"{packages}\n"
+            "Install dependencies in the active environment, then rerun:\n"
+            f"  {sys.executable} -m pip install -r requirements.txt\n"
+            "If PyTorch is already installed and you only need dataset dependencies:\n"
+            f"  {sys.executable} -m pip install pandas numpy pymixbox matplotlib scikit-learn"
+        )
 
 
 def colour_command(args: argparse.Namespace, workers: int) -> list[str]:
@@ -226,8 +252,26 @@ def launch(name: str, command: list[str], log_path: Path) -> tuple[subprocess.Po
     return process, log_handle
 
 
+def terminate_remaining(processes: dict[str, tuple[subprocess.Popen, object]]) -> None:
+    for name, (process, _) in processes.items():
+        if process.poll() is None:
+            tqdm.write(f"[TERMINATE] {name}: pid={process.pid}")
+            process.terminate()
+    deadline = time.monotonic() + 15.0
+    for name, (process, _) in processes.items():
+        if process.poll() is not None:
+            continue
+        remaining = max(deadline - time.monotonic(), 0.0)
+        try:
+            process.wait(timeout=remaining)
+        except subprocess.TimeoutExpired:
+            tqdm.write(f"[KILL] {name}: pid={process.pid}")
+            process.kill()
+
+
 def main() -> None:
     args = parse_args()
+    check_required_modules()
     colour_workers, chemistry_workers = split_workers(args.parallel_workers)
     write_manifest(args, colour_workers, chemistry_workers)
     total_runs = 12
@@ -261,6 +305,8 @@ def main() -> None:
                 tqdm.write(f"[FAILED] {name}: return_code={return_code}")
                 suite_log_path = args.output_root / "launcher_logs" / f"{name}.log"
                 tqdm.write(f"[FAILED SUITE LOG TAIL] {suite_log_path}\n{read_text_tail(suite_log_path)}")
+                remaining = {key: value for key, value in processes.items() if key != name}
+                terminate_remaining(remaining)
             else:
                 tqdm.write(f"[DONE] {name}")
         for name in finished:

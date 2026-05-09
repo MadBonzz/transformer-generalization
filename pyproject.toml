@@ -9,6 +9,10 @@ dependencies = [
     "torchvision",
     "tqdm",
     "matplotlib",
+    "numpy",
+    "pandas",
+    "pymixbox==2.0.0",
+    "scikit-learn",
 ]
 
 [build-system]
