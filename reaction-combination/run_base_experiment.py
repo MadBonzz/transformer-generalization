@@ -832,6 +832,16 @@ def read_progress_state(output_dir: Path) -> dict[str, object] | None:
         return None
 
 
+def read_log_tail(path: Path, *, max_lines: int = 80) -> str:
+    if not path.exists():
+        return f"<missing log: {path}>"
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError as exc:
+        return f"<could not read log {path}: {exc}>"
+    return "\n".join(lines[-max_lines:])
+
+
 def format_running_status(item: dict[str, object]) -> str:
     output_dir = item["output_dir"]
     assert isinstance(output_dir, Path)
@@ -871,6 +881,10 @@ def run_parallel(args: argparse.Namespace, jobs: list[tuple[int, int]], dataset_
             log_handle.close()
             if return_code != 0:
                 progress.close()
+                log_path = item["log_path"]
+                assert isinstance(log_path, Path)
+                tqdm.write(f"[FAILED] layers={item['layers']} seed={item['seed']} return_code={return_code}")
+                tqdm.write(f"[FAILED LOG TAIL] {log_path}\n{read_log_tail(log_path)}")
                 raise subprocess.CalledProcessError(return_code, process.args)
             completed += 1
             progress.update(1)
@@ -901,6 +915,7 @@ def run_parallel(args: argparse.Namespace, jobs: list[tuple[int, int]], dataset_
                     "layers": layers,
                     "seed": seed,
                     "output_dir": output_dir,
+                    "log_path": log_path,
                 }
             )
             tqdm.write(f"[LAUNCH] layers={layers} seed={seed} pid={process.pid} log={log_path}")

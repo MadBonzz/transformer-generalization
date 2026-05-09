@@ -7,6 +7,8 @@ import sys
 import time
 from pathlib import Path
 
+from tqdm.auto import tqdm
+
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 DEFAULT_OUTPUT_ROOT = ROOT_DIR / "outputs" / "colour_reaction_12runs"
@@ -31,6 +33,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--reaction-num-rows", type=int, default=100000)
     parser.add_argument("--reaction-max-scale", type=int, default=12)
     parser.add_argument("--poll-interval-sec", type=float, default=5.0)
+    parser.add_argument("--progress-report-every-sec", type=float, default=30.0)
     return parser.parse_args()
 
 
@@ -133,9 +136,84 @@ def write_manifest(args: argparse.Namespace, colour_workers: int, chemistry_work
         "weight_decay": args.weight_decay,
         "eval_every": args.eval_every,
         "log_every": args.log_every,
+        "poll_interval_sec": args.poll_interval_sec,
+        "progress_report_every_sec": args.progress_report_every_sec,
         "dataset_seed": args.dataset_seed,
     }
     (args.output_root / "combined_manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+
+
+def read_text_tail(path: Path, *, max_lines: int = 100) -> str:
+    if not path.exists():
+        return f"<missing log: {path}>"
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError as exc:
+        return f"<could not read {path}: {exc}>"
+    return "\n".join(lines[-max_lines:])
+
+
+def read_json_safely(path: Path) -> dict[str, object] | None:
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def discover_run_progress(output_root: Path) -> list[dict[str, object]]:
+    records: list[dict[str, object]] = []
+    for suite_name in ("colour", "chemistry"):
+        runs_dir = output_root / suite_name / "runs"
+        if not runs_dir.exists():
+            continue
+        for progress_path in sorted(runs_dir.glob("*/progress.json")):
+            payload = read_json_safely(progress_path)
+            if payload is None:
+                continue
+            step = int(payload.get("step", 0))
+            max_steps = int(payload.get("max_steps", 0))
+            status = str(payload.get("status", "unknown"))
+            records.append(
+                {
+                    "suite": suite_name,
+                    "run_name": progress_path.parent.name,
+                    "status": status,
+                    "step": step,
+                    "max_steps": max_steps,
+                    "progress_fraction": 1.0 if max_steps <= 0 else min(max(step / max_steps, 0.0), 1.0),
+                    "path": progress_path,
+                }
+            )
+    return records
+
+
+def format_run_progress(record: dict[str, object]) -> str:
+    step = int(record["step"])
+    max_steps = int(record["max_steps"])
+    status = str(record["status"])
+    run_name = str(record["run_name"])
+    suite = str(record["suite"])
+    if max_steps <= 0:
+        return f"{suite}/{run_name} {status} step={step}"
+    percent = 100.0 * step / max_steps
+    return f"{suite}/{run_name} {status} {step}/{max_steps} ({percent:.1f}%)"
+
+
+def print_progress_snapshot(output_root: Path, *, total_runs: int, show_completed: bool = False) -> int:
+    records = discover_run_progress(output_root)
+    completed = sum(1 for record in records if str(record["status"]) == "completed")
+    failed = sum(1 for record in records if str(record["status"]) == "failed")
+    running = [record for record in records if str(record["status"]) not in {"completed", "failed"}]
+    tqdm.write(
+        f"[RUN PROGRESS] discovered={len(records)}/{total_runs} | "
+        f"completed={completed}/{total_runs} | failed={failed} | running={len(running)}"
+    )
+    displayed = records if show_completed else [record for record in records if str(record["status"]) != "completed"]
+    for record in sorted(displayed, key=lambda item: (str(item["suite"]), str(item["run_name"]))):
+        tqdm.write(f"  {format_run_progress(record)}")
+    return completed
 
 
 def launch(name: str, command: list[str], log_path: Path) -> tuple[subprocess.Popen, object]:
@@ -152,6 +230,7 @@ def main() -> None:
     args = parse_args()
     colour_workers, chemistry_workers = split_workers(args.parallel_workers)
     write_manifest(args, colour_workers, chemistry_workers)
+    total_runs = 12
 
     colour_process, colour_log = launch(
         "colour",
@@ -166,6 +245,9 @@ def main() -> None:
 
     processes = {"colour": (colour_process, colour_log), "chemistry": (chemistry_process, chemistry_log)}
     failed: list[str] = []
+    progress = tqdm(total=total_runs, desc="combined runs", unit="run", dynamic_ncols=True)
+    last_completed = 0
+    last_progress_report_at = 0.0
     while processes:
         finished: list[str] = []
         for name, (process, log_handle) in processes.items():
@@ -176,16 +258,31 @@ def main() -> None:
             finished.append(name)
             if return_code != 0:
                 failed.append(name)
-                print(f"[FAILED] {name}: return_code={return_code}")
+                tqdm.write(f"[FAILED] {name}: return_code={return_code}")
+                suite_log_path = args.output_root / "launcher_logs" / f"{name}.log"
+                tqdm.write(f"[FAILED SUITE LOG TAIL] {suite_log_path}\n{read_text_tail(suite_log_path)}")
             else:
-                print(f"[DONE] {name}")
+                tqdm.write(f"[DONE] {name}")
         for name in finished:
             del processes[name]
+
+        now = time.monotonic()
+        should_report = bool(finished) or now - last_progress_report_at >= args.progress_report_every_sec
+        if should_report:
+            completed = print_progress_snapshot(args.output_root, total_runs=total_runs)
+            if completed > last_completed:
+                progress.update(completed - last_completed)
+                last_completed = completed
+            last_progress_report_at = now
         if processes:
             active = ", ".join(f"{name}=pid{process.pid}" for name, (process, _) in processes.items())
-            print(f"[ACTIVE] {active}")
+            tqdm.write(f"[ACTIVE SUITES] {active}")
             time.sleep(args.poll_interval_sec)
 
+    completed = print_progress_snapshot(args.output_root, total_runs=total_runs, show_completed=True)
+    if completed > last_completed:
+        progress.update(completed - last_completed)
+    progress.close()
     if failed:
         raise SystemExit(f"failed suites: {', '.join(failed)}")
     print(f"[DONE] combined output bundle: {args.output_root}")

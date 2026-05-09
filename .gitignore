@@ -14,6 +14,9 @@ venv/
 # Editors / OS
 .DS_Store
 Thumbs.db
+Screenshot*.png
+Screenshot*.jpg
+Screenshot*.jpeg
 
 # Local experiment artifacts
 outputs/
