@@ -103,7 +103,9 @@ def run_dir_for(output_root: Path, *, layers: int, seed: int, learning_rate: flo
 
 
 def generate_dataset(args: argparse.Namespace, dataset_dir: Path) -> None:
-    subprocess.run(
+    args.output_root.mkdir(parents=True, exist_ok=True)
+    log_path = args.output_root / "dataset_generation.log"
+    completed = subprocess.run(
         [
             sys.executable,
             str(THIS_DIR / "generate_mixbox_dataset.py"),
@@ -114,8 +116,15 @@ def generate_dataset(args: argparse.Namespace, dataset_dir: Path) -> None:
             "--num-base-colors",
             str(args.num_base_colors),
         ],
-        check=True,
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
     )
+    log_path.write_text(completed.stdout, encoding="utf-8")
+    print(completed.stdout, end="")
+    if completed.returncode != 0:
+        raise subprocess.CalledProcessError(completed.returncode, completed.args, output=completed.stdout)
 
 
 def load_split_dataset(dataset_dir: Path, split: str) -> TaskDataset:
@@ -225,9 +234,13 @@ def write_manifest(args: argparse.Namespace, jobs: list[tuple[int, int]], datase
         "eval_every": args.eval_every,
         "log_every": args.log_every,
         "checkpoint_schedule": args.checkpoint_schedule,
+        "checkpoint_every_steps": (
+            args.checkpoint_every_steps if args.checkpoint_schedule == "fixed" else None
+        ),
         "checkpoint_steps": list(staged_checkpoint_steps(args.max_steps))
         if args.checkpoint_schedule == "staged"
         else None,
+        "dataset_generation_log": str(args.output_root / "dataset_generation.log"),
         "jobs": [
             {
                 "layers": layers,

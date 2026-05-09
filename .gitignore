@@ -16,8 +16,13 @@ venv/
 Thumbs.db
 
 # Local experiment artifacts
+outputs/
+**/outputs/
+**/outputs/**
 **/*output*/
 **/*output*/**
+**/*outputs*/
+**/*outputs*/**
 outputs/**/final_checkpoint.pt
 outputs/**/dataset_snapshot.pt
 outputs/**/launcher.log
