@@ -47,9 +47,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--checkpoint-schedule",
         type=str,
-        default="fixed",
+        default="staged",
         choices=["staged", "fixed", "none"],
-        help="staged: 1k to 10k, 5k to 50k, 10k after 50k; fixed: use --checkpoint-every-steps.",
+        help="staged: every 1k through 25k, then every --checkpoint-every-steps; fixed: use only --checkpoint-every-steps.",
     )
     parser.add_argument("--checkpoint-every-steps", type=int, default=25000)
     parser.add_argument("--batch-size", type=int, default=256)
@@ -73,12 +73,10 @@ def resolve_device(device: str) -> str:
     return device
 
 
-def staged_checkpoint_steps(max_steps: int) -> tuple[int, ...]:
-    steps = set(range(1000, min(max_steps, 10000) + 1, 1000))
-    if max_steps > 10000:
-        steps.update(range(15000, min(max_steps, 50000) + 1, 5000))
-    if max_steps > 50000:
-        steps.update(range(60000, max_steps + 1, 10000))
+def staged_checkpoint_steps(max_steps: int, interval_after_early: int) -> tuple[int, ...]:
+    steps = set(range(1000, min(max_steps, 25000) + 1, 1000))
+    if max_steps > 25000 and interval_after_early > 0:
+        steps.update(range(50000, max_steps + 1, interval_after_early))
     return tuple(sorted(steps))
 
 
@@ -86,7 +84,7 @@ def checkpoint_steps_for_args(args: argparse.Namespace) -> tuple[int, ...] | Non
     if args.checkpoint_schedule == "none":
         return None
     if args.checkpoint_schedule == "staged":
-        return staged_checkpoint_steps(args.max_steps)
+        return staged_checkpoint_steps(args.max_steps, args.checkpoint_every_steps)
     return None
 
 
@@ -227,6 +225,7 @@ def write_manifest(args: argparse.Namespace, jobs: list[tuple[int, int]], datase
         "num_rows": 100000,
         "num_base_colours": args.num_base_colors,
         "split_fractions": {"train": 0.5, "val": 0.25, "test": 0.25},
+        "full_train_eval_logged": True,
         "max_steps": args.max_steps,
         "batch_size": args.batch_size,
         "learning_rate": args.learning_rate,
@@ -237,7 +236,7 @@ def write_manifest(args: argparse.Namespace, jobs: list[tuple[int, int]], datase
         "checkpoint_every_steps": (
             args.checkpoint_every_steps if args.checkpoint_schedule == "fixed" else None
         ),
-        "checkpoint_steps": list(staged_checkpoint_steps(args.max_steps))
+        "checkpoint_steps": list(staged_checkpoint_steps(args.max_steps, args.checkpoint_every_steps))
         if args.checkpoint_schedule == "staged"
         else None,
         "dataset_generation_log": str(args.output_root / "dataset_generation.log"),

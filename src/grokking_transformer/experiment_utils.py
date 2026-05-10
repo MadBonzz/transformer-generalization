@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import csv
 import math
+import platform
 import random
+import subprocess
+import sys
 import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
@@ -183,6 +186,52 @@ def _cuda_memory_stats(device: torch.device) -> dict[str, float]:
         "cuda_peak_allocated_mb": float(peak_allocated),
         "cuda_peak_reserved_mb": float(peak_reserved),
     }
+
+
+def _git_value(args: list[str]) -> str | None:
+    try:
+        completed = subprocess.run(
+            ["git", *args],
+            cwd=Path(__file__).resolve().parents[2],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+    except OSError:
+        return None
+    if completed.returncode != 0:
+        return None
+    return completed.stdout.strip()
+
+
+def runtime_environment_payload(device: torch.device) -> dict[str, object]:
+    git_status = _git_value(["status", "--short"])
+    payload: dict[str, object] = {
+        "created_at_utc": _timestamp_utc(),
+        "command": sys.argv,
+        "cwd": str(Path.cwd()),
+        "python_executable": sys.executable,
+        "python_version": sys.version,
+        "platform": platform.platform(),
+        "torch_version": torch.__version__,
+        "torch_cuda_available": torch.cuda.is_available(),
+        "torch_cuda_version": torch.version.cuda,
+        "device": str(device),
+        "git_commit": _git_value(["rev-parse", "HEAD"]),
+        "git_branch": _git_value(["rev-parse", "--abbrev-ref", "HEAD"]),
+        "git_is_dirty": bool(git_status),
+        "git_status_short": git_status or "",
+    }
+    if device.type == "cuda" and torch.cuda.is_available():
+        payload.update(
+            {
+                "cuda_device_count": torch.cuda.device_count(),
+                "cuda_device_name": torch.cuda.get_device_name(device),
+                "cuda_device_capability": torch.cuda.get_device_capability(device),
+            }
+        )
+    return payload
 
 
 def _make_dataloader(dataset: TaskDataset, batch_size: int, shuffle: bool, full_batch: bool) -> DataLoader:
@@ -449,8 +498,9 @@ def run_training(
     metrics_path = output_dir / "metrics.jsonl"
     metrics_csv_path = output_dir / "metrics.csv"
     progress_path = output_dir / "progress.json"
+    eval_datasets_with_train = {"train": train_dataset, **eval_datasets}
     metrics_fieldnames = _metrics_fieldnames(
-        eval_split_names=sorted(eval_datasets.keys()),
+        eval_split_names=["train", *sorted(eval_datasets.keys())],
         objective=config.objective,
     )
 
@@ -473,6 +523,7 @@ def run_training(
             steps_per_epoch=len(train_loader),
         ),
     )
+    write_json(output_dir / "runtime_environment.json", runtime_environment_payload(device))
     export_dataset_snapshot(
         path=output_dir / "dataset_snapshot.pt",
         train_dataset=train_dataset,
@@ -557,11 +608,12 @@ def run_training(
                 }
                 record.update(_cuda_memory_stats(device))
                 for key, value in train_metrics.items():
-                    record[f"train_{key}"] = value
+                    if key != "loss":
+                        record[f"train_{key}"] = value
 
                 if step == 1 or step % config.eval_every == 0 or step == config.max_steps:
                     final_eval = {}
-                    for split_name, dataset in eval_datasets.items():
+                    for split_name, dataset in eval_datasets_with_train.items():
                         split_metrics = evaluate_dataset(
                             model=model,
                             dataset=dataset,
@@ -601,7 +653,7 @@ def run_training(
                     train_size=len(train_dataset),
                     steps_per_epoch=len(train_loader),
                     train_loss=train_loss,
-                    train_metrics=train_metrics,
+                    train_metrics={key: value for key, value in train_metrics.items() if key != "loss"} or None,
                     eval_metrics=final_eval or None,
                 )
                 last_progress_write_at = time.monotonic()
@@ -642,7 +694,7 @@ def run_training(
             train_size=len(train_dataset),
             steps_per_epoch=len(train_loader),
             train_loss=train_loss if not math.isnan(train_loss) else None,
-            train_metrics=train_metrics or None,
+            train_metrics={key: value for key, value in train_metrics.items() if key != "loss"} or None,
             eval_metrics=final_eval or None,
         )
         progress.close()
@@ -697,8 +749,17 @@ def run_training(
         train_size=len(train_dataset),
         steps_per_epoch=len(train_loader),
         train_loss=train_loss,
-        train_metrics=train_metrics,
+        train_metrics={key: value for key, value in train_metrics.items() if key != "loss"} or None,
         eval_metrics=final_eval,
+    )
+    export_prediction_table(
+        path=output_dir / "train_predictions.csv",
+        model=model,
+        dataset=train_dataset,
+        device=device,
+        batch_size=config.batch_size,
+        full_batch=config.full_batch,
+        target_vocab_size=info.target_vocab_size,
     )
     for split_name, dataset in eval_datasets.items():
         export_prediction_table(

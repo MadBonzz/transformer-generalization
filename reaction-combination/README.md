@@ -23,12 +23,15 @@ target fixed at 2 tokens.
 
 The dataset is generated from:
 
+- curated binary element-element synthesis reactions,
 - curated single-product synthesis reactions,
 - acid-base neutralization templates,
 - aqueous double-displacement reactions filtered by standard solubility rules.
 
 Every accepted row is atom-balanced by parsing the formulas and validating atom
-counts before it is written. The dataset is deterministic with seed `42`.
+counts before it is written. By default, each canonical reaction is written once:
+there are no scaled stoichiometric variants and no reversed-order duplicate
+inputs. The dataset is deterministic with seed `42`.
 
 Generate the dataset:
 
@@ -55,9 +58,9 @@ Default dataset shape:
 - `50%` train, `25%` validation, `25%` test.
 - `4` input tokens: reactant species, amount, reactant species, amount.
 - `2` output tokens: product species, product species-or-`NULL`.
-- `429` species tokens including `NULL` in the current default generation.
-- `37` amount tokens in the current default generation.
-- `466` total vocabulary tokens in the current default generation.
+- about `2.5k` species tokens including `NULL` in the current default generation.
+- about `8` amount tokens in the current default generation.
+- about `600` unique element-element synthesis rows in the current default generation.
 
 To change size while keeping deterministic sampling:
 
@@ -75,7 +78,8 @@ Default experiment settings:
 
 - `6` runs: transformer layers `1, 2` crossed with seeds `0, 1, 2`.
 - `500,000` training steps per run.
-- checkpoints every `25,000` steps.
+- full train/val/test metrics every `500` steps.
+- staged checkpoints every `1,000` steps through `25,000`, then every `25,000` steps.
 - `batch_size=256`, `learning_rate=1e-3`, `weight_decay=0.5`.
 - one output bundle under `reaction-combination/outputs/reaction_base_case/`.
 

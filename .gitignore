@@ -49,3 +49,8 @@ outputs/**/*.png
 *.ckpt
 
 # Output archives are intentionally kept out of new commits by default.
+analysis_extracted/
+*.tar
+*.tar.gz
+*.tgz
+*.zip

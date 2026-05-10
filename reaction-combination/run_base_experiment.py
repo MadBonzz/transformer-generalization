@@ -4,6 +4,7 @@ import argparse
 import csv
 import json
 import math
+import platform
 import subprocess
 import sys
 import time
@@ -123,6 +124,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-steps", type=int, default=500000)
     parser.add_argument("--eval-every", type=int, default=500)
     parser.add_argument("--log-every", type=int, default=100)
+    parser.add_argument(
+        "--checkpoint-schedule",
+        type=str,
+        default="staged",
+        choices=["staged", "fixed", "none"],
+        help="staged: every 1k through 25k, then every --checkpoint-every-steps; fixed: use only --checkpoint-every-steps.",
+    )
     parser.add_argument("--checkpoint-every-steps", type=int, default=25000)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
@@ -131,6 +139,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset-seed", type=int, default=42)
     parser.add_argument("--num-rows", type=int, default=100000)
     parser.add_argument("--max-scale", type=int, default=12)
+    parser.add_argument("--element-max-scale", type=int, default=1)
+    parser.add_argument("--element-synthesis-fraction", type=float, default=0.50)
     parser.add_argument("--parallel-workers", type=int, default=1)
     parser.add_argument("--poll-interval-sec", type=float, default=2.0)
     parser.add_argument("--launch-settle-sec", type=float, default=1.0)
@@ -144,6 +154,21 @@ def resolve_device(device: str) -> str:
     if device == "auto":
         return "cuda" if torch.cuda.is_available() else "cpu"
     return device
+
+
+def staged_checkpoint_steps(max_steps: int, interval_after_early: int) -> tuple[int, ...]:
+    steps = set(range(1000, min(max_steps, 25000) + 1, 1000))
+    if max_steps > 25000 and interval_after_early > 0:
+        steps.update(range(50000, max_steps + 1, interval_after_early))
+    return tuple(sorted(steps))
+
+
+def checkpoint_steps_for_args(args: argparse.Namespace) -> tuple[int, ...] | None:
+    if args.checkpoint_schedule == "none":
+        return None
+    if args.checkpoint_schedule == "staged":
+        return staged_checkpoint_steps(args.max_steps, args.checkpoint_every_steps)
+    return None
 
 
 def timestamp_utc() -> str:
@@ -181,6 +206,10 @@ def generate_dataset(args: argparse.Namespace, dataset_dir: Path) -> None:
             str(args.num_rows),
             "--max-scale",
             str(args.max_scale),
+            "--element-max-scale",
+            str(args.element_max_scale),
+            "--element-synthesis-fraction",
+            str(args.element_synthesis_fraction),
         ],
         check=False,
         stdout=subprocess.PIPE,
@@ -269,6 +298,9 @@ def validate_dataset(dataset_dir: Path) -> dict[str, object]:
     split_counts: dict[str, int] = {}
     null_rows = 0
     two_output_rows = 0
+    family_counts: dict[str, int] = {}
+    element_synthesis_rows = 0
+    element_reactant_species: set[str] = set()
     row_count = 0
     used_species: set[str] = set()
     used_amounts: set[int] = set()
@@ -277,6 +309,12 @@ def validate_dataset(dataset_dir: Path) -> dict[str, object]:
         for row in csv.DictReader(file):
             row_count += 1
             split_counts[row["split"]] = split_counts.get(row["split"], 0) + 1
+            family = row.get("family", "")
+            family_counts[family] = family_counts.get(family, 0) + 1
+            if family == "element_synthesis":
+                element_synthesis_rows += 1
+                element_reactant_species.add(row["reactant_1"])
+                element_reactant_species.add(row["reactant_2"])
             species_values = [row["reactant_1"], row["reactant_2"], row["output_1"], row["output_2"]]
             amount_values = [int(row["amount_1"]), int(row["amount_2"])]
             for species in species_values:
@@ -315,11 +353,14 @@ def validate_dataset(dataset_dir: Path) -> dict[str, object]:
         "used_amount_count": len(used_amounts),
         "two_output_rows": two_output_rows,
         "single_output_rows_with_NULL": null_rows,
+        "family_counts": family_counts,
+        "element_synthesis_rows": element_synthesis_rows,
+        "unique_element_reactant_tokens_in_element_synthesis": len(element_reactant_species),
         "null_token_id": species_to_id[NULL_TOKEN],
         "tokenization": "Each full element/molecule formula is one species token ID; formulas are not split into atom/subformula tokens.",
         "chemistry_grounding": (
-            "Every CSV row is generated from curated synthesis, acid-base neutralization, or solubility-rule "
-            "double-displacement templates, and every written equation is atom-balance validated."
+            "Every CSV row is generated from curated element-element synthesis, acid-base neutralization, "
+            "or solubility-rule double-displacement templates, and every written equation is atom-balance validated."
         ),
     }
     write_json(dataset_dir / "dataset_validation.json", validation)
@@ -396,6 +437,52 @@ def cuda_memory_stats(device: torch.device) -> dict[str, float]:
         "cuda_peak_allocated_mb": float(torch.cuda.max_memory_allocated(device) / (1024 ** 2)),
         "cuda_peak_reserved_mb": float(torch.cuda.max_memory_reserved(device) / (1024 ** 2)),
     }
+
+
+def git_value(args: list[str]) -> str | None:
+    try:
+        completed = subprocess.run(
+            ["git", *args],
+            cwd=ROOT_DIR,
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+    except OSError:
+        return None
+    if completed.returncode != 0:
+        return None
+    return completed.stdout.strip()
+
+
+def runtime_environment_payload(device: torch.device) -> dict[str, object]:
+    git_status = git_value(["status", "--short"])
+    payload: dict[str, object] = {
+        "created_at_utc": timestamp_utc(),
+        "command": sys.argv,
+        "cwd": str(Path.cwd()),
+        "python_executable": sys.executable,
+        "python_version": sys.version,
+        "platform": platform.platform(),
+        "torch_version": torch.__version__,
+        "torch_cuda_available": torch.cuda.is_available(),
+        "torch_cuda_version": torch.version.cuda,
+        "device": str(device),
+        "git_commit": git_value(["rev-parse", "HEAD"]),
+        "git_branch": git_value(["rev-parse", "--abbrev-ref", "HEAD"]),
+        "git_is_dirty": bool(git_status),
+        "git_status_short": git_status or "",
+    }
+    if device.type == "cuda" and torch.cuda.is_available():
+        payload.update(
+            {
+                "cuda_device_count": torch.cuda.device_count(),
+                "cuda_device_name": torch.cuda.get_device_name(device),
+                "cuda_device_capability": torch.cuda.get_device_capability(device),
+            }
+        )
+    return payload
 
 
 def save_checkpoint(path: Path, *, model: nn.Module, optimizer: torch.optim.Optimizer, step: int, result: dict[str, object]) -> None:
@@ -529,8 +616,8 @@ def run_one(args: argparse.Namespace, *, layers: int, seed: int) -> dict[str, ob
         device=resolve_device(args.device),
         output_dir=str(output_dir),
         transformer_n_layers=layers,
-        checkpoint_every_steps=args.checkpoint_every_steps,
-        checkpoint_steps=None,
+        checkpoint_every_steps=args.checkpoint_every_steps if args.checkpoint_schedule == "fixed" else None,
+        checkpoint_steps=checkpoint_steps_for_args(args),
         metadata={
             "dataset": str(metadata["name"]),
             "dataset_dir": str(args.dataset_dir),
@@ -543,6 +630,8 @@ def run_one(args: argparse.Namespace, *, layers: int, seed: int) -> dict[str, ob
             "num_species_tokens_including_null": metadata["num_species_tokens_including_null"],
             "num_amount_tokens": metadata["num_amount_tokens"],
             "target_design": metadata["target_design"],
+            "element_synthesis_fraction": metadata.get("element_synthesis_fraction"),
+            "element_synthesis_rows": metadata.get("element_synthesis_rows"),
         },
     )
 
@@ -556,6 +645,7 @@ def run_one(args: argparse.Namespace, *, layers: int, seed: int) -> dict[str, ob
     val_dataset = load_split_dataset(args.dataset_dir, "val")
     test_dataset = load_split_dataset(args.dataset_dir, "test")
     eval_datasets = {"val": val_dataset, "test": test_dataset}
+    eval_datasets_with_train = {"train": train_dataset, **eval_datasets}
     vocab_size = int(metadata["vocab_size"])
     target_vocab_size = int(metadata["target_vocab_size"])
     seq_len = int(metadata["sequence_length"])
@@ -579,12 +669,13 @@ def run_one(args: argparse.Namespace, *, layers: int, seed: int) -> dict[str, ob
             "parameter_count": parameter_count(model),
         },
     )
+    write_json(output_dir / "runtime_environment.json", runtime_environment_payload(device))
     export_dataset_snapshot(output_dir / "dataset_snapshot.pt", train_dataset, eval_datasets)
 
     metrics_path = output_dir / "metrics.jsonl"
     metrics_csv_path = output_dir / "metrics.csv"
     progress_path = output_dir / "progress.json"
-    metric_fields = metrics_fieldnames(sorted(eval_datasets.keys()))
+    metric_fields = metrics_fieldnames(["train", *sorted(eval_datasets.keys())])
     write_progress(
         progress_path,
         config=config,
@@ -627,7 +718,7 @@ def run_one(args: argparse.Namespace, *, layers: int, seed: int) -> dict[str, ob
                 record.update(cuda_memory_stats(device))
                 if step == 1 or step % config.eval_every == 0 or step == config.max_steps:
                     final_eval = {}
-                    for split_name, dataset in eval_datasets.items():
+                    for split_name, dataset in eval_datasets_with_train.items():
                         split_metrics = evaluate(model, dataset, device=device, batch_size=config.batch_size)
                         final_eval[split_name] = split_metrics
                         for key, value in split_metrics.items():
@@ -676,7 +767,10 @@ def run_one(args: argparse.Namespace, *, layers: int, seed: int) -> dict[str, ob
 
     progress.close()
     if not final_eval:
-        final_eval = {split_name: evaluate(model, dataset, device=device, batch_size=config.batch_size) for split_name, dataset in eval_datasets.items()}
+        final_eval = {
+            split_name: evaluate(model, dataset, device=device, batch_size=config.batch_size)
+            for split_name, dataset in eval_datasets_with_train.items()
+        }
     result = {
         "study_name": config.study_name,
         "seed": config.seed,
@@ -708,6 +802,7 @@ def run_one(args: argparse.Namespace, *, layers: int, seed: int) -> dict[str, ob
         train_loss=train_loss,
         eval_metrics=final_eval,
     )
+    export_prediction_table(output_dir / "train_predictions.csv", model, train_dataset, device=device, batch_size=config.batch_size)
     for split_name, dataset in eval_datasets.items():
         export_prediction_table(output_dir / f"{split_name}_predictions.csv", model, dataset, device=device, batch_size=config.batch_size)
     save_checkpoint(output_dir / "final_checkpoint.pt", model=model, optimizer=optimizer, step=step, result=result)
@@ -726,13 +821,20 @@ def write_manifest(args: argparse.Namespace, jobs: list[tuple[int, int]], datase
         "dataset_seed": args.dataset_seed,
         "num_rows": args.num_rows,
         "split_fractions": {"train": 0.5, "val": 0.25, "test": 0.25},
+        "full_train_eval_logged": True,
+        "element_synthesis_fraction": args.element_synthesis_fraction,
+        "element_max_scale": args.element_max_scale,
         "max_steps": args.max_steps,
         "batch_size": args.batch_size,
         "learning_rate": args.learning_rate,
         "weight_decay": args.weight_decay,
         "eval_every": args.eval_every,
         "log_every": args.log_every,
+        "checkpoint_schedule": args.checkpoint_schedule,
         "checkpoint_every_steps": args.checkpoint_every_steps,
+        "checkpoint_steps": list(staged_checkpoint_steps(args.max_steps, args.checkpoint_every_steps))
+        if args.checkpoint_schedule == "staged"
+        else None,
         "dataset_generation_log": str(args.output_root / "dataset_generation.log"),
         "dataset_validation": validation,
         "jobs": [
@@ -803,6 +905,8 @@ def single_run_command(args: argparse.Namespace, *, layers: int, seed: int, data
         str(args.eval_every),
         "--log-every",
         str(args.log_every),
+        "--checkpoint-schedule",
+        args.checkpoint_schedule,
         "--checkpoint-every-steps",
         str(args.checkpoint_every_steps),
         "--batch-size",
@@ -819,6 +923,10 @@ def single_run_command(args: argparse.Namespace, *, layers: int, seed: int, data
         str(args.num_rows),
         "--max-scale",
         str(args.max_scale),
+        "--element-max-scale",
+        str(args.element_max_scale),
+        "--element-synthesis-fraction",
+        str(args.element_synthesis_fraction),
     ]
 
 

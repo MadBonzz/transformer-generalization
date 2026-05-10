@@ -18,6 +18,9 @@ DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parent / "outputs" / "reaction_com
 TRAIN_FRACTION = 0.50
 VAL_FRACTION = 0.25
 NULL_TOKEN = "NULL"
+DEFAULT_ELEMENT_SYNTHESIS_FRACTION = 0.50
+DEFAULT_ELEMENT_MAX_SCALE = 1
+MAX_DOUBLE_DISPLACEMENT_CANDIDATES = 140_000
 
 
 @dataclass(frozen=True)
@@ -60,9 +63,45 @@ CATIONS: tuple[Ion, ...] = (
     Ion("Sn", 2, "post_transition"),
     Ion("Al", 3, "post_transition"),
     Ion("Cr", 3, "transition"),
+    Ion("Be", 2, "alkaline_earth"),
+    Ion("Cd", 2, "transition"),
+    Ion("Hg", 2, "transition"),
+    Ion("Cu", 1, "transition"),
+    Ion("Co", 3, "transition"),
+    Ion("Ni", 3, "transition"),
+    Ion("Mn", 3, "transition"),
+    Ion("Mn", 4, "transition"),
+    Ion("Cr", 2, "transition"),
+    Ion("Ti", 2, "transition"),
+    Ion("Ti", 3, "transition"),
+    Ion("Ti", 4, "transition"),
+    Ion("V", 2, "transition"),
+    Ion("V", 3, "transition"),
+    Ion("V", 5, "transition"),
+    Ion("Zr", 4, "transition"),
+    Ion("Hf", 4, "transition"),
+    Ion("Sc", 3, "transition"),
+    Ion("Y", 3, "transition"),
+    Ion("La", 3, "lanthanide"),
+    Ion("Ce", 3, "lanthanide"),
+    Ion("Ce", 4, "lanthanide"),
+    Ion("Ga", 3, "post_transition"),
+    Ion("In", 3, "post_transition"),
+    Ion("Bi", 3, "post_transition"),
+    Ion("Sb", 3, "metalloid"),
+    Ion("Au", 1, "transition"),
+    Ion("Au", 3, "transition"),
+    Ion("Pt", 2, "transition"),
+    Ion("Pt", 4, "transition"),
+    Ion("Pd", 2, "transition"),
+    Ion("Mo", 6, "transition"),
+    Ion("W", 6, "transition"),
+    Ion("Nb", 5, "transition"),
+    Ion("Ta", 5, "transition"),
 )
 
 ANIONS: tuple[Ion, ...] = (
+    Ion("H", -1, "hydride"),
     Ion("F", -1, "halide"),
     Ion("Cl", -1, "halide"),
     Ion("Br", -1, "halide"),
@@ -80,6 +119,31 @@ ANIONS: tuple[Ion, ...] = (
     Ion("C2O4", -2, "oxalate"),
     Ion("CrO4", -2, "chromate"),
     Ion("PO4", -3, "phosphate"),
+    Ion("O", -2, "oxide"),
+    Ion("N", -3, "nitride"),
+    Ion("P", -3, "phosphide"),
+    Ion("Se", -2, "selenide"),
+    Ion("Te", -2, "telluride"),
+    Ion("CN", -1, "cyanide"),
+    Ion("SCN", -1, "thiocyanate"),
+    Ion("OCN", -1, "cyanate"),
+    Ion("MnO4", -1, "permanganate"),
+    Ion("HCO3", -1, "bicarbonate"),
+    Ion("HSO4", -1, "bisulfate"),
+    Ion("HSO3", -1, "bisulfite"),
+    Ion("H2PO4", -1, "dihydrogen_phosphate"),
+    Ion("HPO4", -2, "hydrogen_phosphate"),
+    Ion("BO3", -3, "borate"),
+    Ion("SiO3", -2, "silicate"),
+    Ion("BrO3", -1, "bromate"),
+    Ion("IO3", -1, "iodate"),
+    Ion("ClO", -1, "hypochlorite"),
+    Ion("IO4", -1, "periodate"),
+    Ion("SeO4", -2, "selenate"),
+    Ion("S2O3", -2, "thiosulfate"),
+    Ion("MoO4", -2, "molybdate"),
+    Ion("WO4", -2, "tungstate"),
+    Ion("AsO4", -3, "arsenate"),
 )
 
 ACID_ANIONS: tuple[Ion, ...] = (
@@ -142,13 +206,155 @@ SYNTHESIS_REACTIONS: tuple[CandidateReaction, ...] = (
 )
 
 
+def element_synthesis_reactions() -> tuple[CandidateReaction, ...]:
+    """Conservative binary element synthesis set for common inorganic products.
+
+    These rows intentionally use elemental reactants only. The balancing step later
+    rejects any malformed formula, and all accepted equations are atom-balanced.
+    """
+
+    candidates: list[CandidateReaction] = []
+    metal_cations = tuple(cation for cation in CATIONS if cation.formula != "NH4")
+    unique_metal_cations = list(dict.fromkeys(metal_cations))
+
+    halogens = (
+        ("F2", Ion("F", -1, "halide")),
+        ("Cl2", Ion("Cl", -1, "halide")),
+        ("Br2", Ion("Br", -1, "halide")),
+        ("I2", Ion("I", -1, "halide")),
+    )
+    for cation in unique_metal_cations:
+        for halogen_species, anion in halogens:
+            product = neutral_compound(cation, anion)
+            candidates.append(
+                CandidateReaction(
+                    cation.formula,
+                    halogen_species,
+                    (product,),
+                    "element_synthesis",
+                    "metal + elemental halogen -> binary metal halide",
+                    note="binary element synthesis",
+                )
+            )
+
+    oxide_anion = Ion("O", -2, "oxide")
+    sulfide_anion = Ion("S", -2, "sulfide")
+    for cation in unique_metal_cations:
+        candidates.append(
+            CandidateReaction(
+                cation.formula,
+                "O2",
+                (neutral_compound(cation, oxide_anion),),
+                "element_synthesis",
+                "metal + oxygen -> binary metal oxide",
+                note="binary element synthesis",
+            )
+        )
+        candidates.append(
+            CandidateReaction(
+                cation.formula,
+                "S",
+                (neutral_compound(cation, sulfide_anion),),
+                "element_synthesis",
+                "metal + sulfur -> binary metal sulfide",
+                note="binary element synthesis",
+            )
+        )
+
+    for reactant_species, anion, rule in (
+        ("N2", Ion("N", -3, "nitride"), "metal + nitrogen -> binary metal nitride"),
+        ("P4", Ion("P", -3, "phosphide"), "metal + phosphorus -> binary metal phosphide"),
+        ("Se", Ion("Se", -2, "selenide"), "metal + selenium -> binary metal selenide"),
+        ("Te", Ion("Te", -2, "telluride"), "metal + tellurium -> binary metal telluride"),
+    ):
+        for cation in unique_metal_cations:
+            candidates.append(
+                CandidateReaction(
+                    cation.formula,
+                    reactant_species,
+                    (neutral_compound(cation, anion),),
+                    "element_synthesis",
+                    rule,
+                    note="binary element synthesis",
+                )
+            )
+
+    hydride_anion = Ion("H", -1, "hydride")
+    hydride_metals = tuple(
+        cation
+        for cation in unique_metal_cations
+        if (cation.formula, cation.charge) in {
+            ("Li", 1),
+            ("Na", 1),
+            ("K", 1),
+            ("Rb", 1),
+            ("Cs", 1),
+            ("Mg", 2),
+            ("Ca", 2),
+            ("Sr", 2),
+            ("Ba", 2),
+        }
+    )
+    for cation in hydride_metals:
+        candidates.append(
+            CandidateReaction(
+                cation.formula,
+                "H2",
+                (neutral_compound(cation, hydride_anion),),
+                "element_synthesis",
+                "metal + hydrogen -> binary metal hydride",
+                note="binary element synthesis",
+            )
+        )
+
+    nonmetal_binary_reactions = (
+        CandidateReaction("H2", "F2", ("HF",), "element_synthesis", "hydrogen + halogen -> hydrogen halide"),
+        CandidateReaction("H2", "Cl2", ("HCl",), "element_synthesis", "hydrogen + halogen -> hydrogen halide"),
+        CandidateReaction("H2", "Br2", ("HBr",), "element_synthesis", "hydrogen + halogen -> hydrogen halide"),
+        CandidateReaction("H2", "I2", ("HI",), "element_synthesis", "hydrogen + halogen -> hydrogen halide"),
+        CandidateReaction("H2", "S", ("H2S",), "element_synthesis", "hydrogen + sulfur -> hydrogen sulfide"),
+        CandidateReaction("H2", "Se", ("H2Se",), "element_synthesis", "hydrogen + selenium -> hydrogen selenide"),
+        CandidateReaction("H2", "Te", ("H2Te",), "element_synthesis", "hydrogen + tellurium -> hydrogen telluride"),
+        CandidateReaction("N2", "H2", ("NH3",), "element_synthesis", "nitrogen + hydrogen -> ammonia"),
+        CandidateReaction("H2", "O2", ("H2O",), "element_synthesis", "hydrogen + oxygen -> water"),
+        CandidateReaction("C", "O2", ("CO2",), "element_synthesis", "carbon + oxygen -> carbon dioxide"),
+        CandidateReaction("C", "O2", ("CO",), "element_synthesis", "carbon + oxygen -> carbon monoxide"),
+        CandidateReaction("S", "O2", ("SO2",), "element_synthesis", "sulfur + oxygen -> sulfur dioxide"),
+        CandidateReaction("Se", "O2", ("SeO2",), "element_synthesis", "selenium + oxygen -> selenium dioxide"),
+        CandidateReaction("Te", "O2", ("TeO2",), "element_synthesis", "tellurium + oxygen -> tellurium dioxide"),
+        CandidateReaction("B", "O2", ("B2O3",), "element_synthesis", "boron + oxygen -> boron oxide"),
+        CandidateReaction("Si", "O2", ("SiO2",), "element_synthesis", "silicon + oxygen -> silicon dioxide"),
+        CandidateReaction("P4", "O2", ("P4O10",), "element_synthesis", "phosphorus + oxygen -> tetraphosphorus decoxide"),
+        CandidateReaction("P4", "Cl2", ("PCl3",), "element_synthesis", "phosphorus + chlorine -> phosphorus trichloride"),
+        CandidateReaction("P4", "Cl2", ("PCl5",), "element_synthesis", "phosphorus + chlorine -> phosphorus pentachloride"),
+        CandidateReaction("P4", "F2", ("PF3",), "element_synthesis", "phosphorus + fluorine -> phosphorus trifluoride"),
+        CandidateReaction("P4", "F2", ("PF5",), "element_synthesis", "phosphorus + fluorine -> phosphorus pentafluoride"),
+        CandidateReaction("S", "F2", ("SF6",), "element_synthesis", "sulfur + fluorine -> sulfur hexafluoride"),
+        CandidateReaction("S", "Cl2", ("SCl2",), "element_synthesis", "sulfur + chlorine -> sulfur dichloride"),
+        CandidateReaction("Si", "Cl2", ("SiCl4",), "element_synthesis", "silicon + chlorine -> silicon tetrachloride"),
+        CandidateReaction("Si", "F2", ("SiF4",), "element_synthesis", "silicon + fluorine -> silicon tetrafluoride"),
+        CandidateReaction("B", "Cl2", ("BCl3",), "element_synthesis", "boron + chlorine -> boron trichloride"),
+        CandidateReaction("B", "F2", ("BF3",), "element_synthesis", "boron + fluorine -> boron trifluoride"),
+        CandidateReaction("Cl2", "F2", ("ClF",), "element_synthesis", "chlorine + fluorine -> chlorine monofluoride"),
+        CandidateReaction("Cl2", "F2", ("ClF3",), "element_synthesis", "chlorine + fluorine -> chlorine trifluoride"),
+        CandidateReaction("Br2", "F2", ("BrF3",), "element_synthesis", "bromine + fluorine -> bromine trifluoride"),
+        CandidateReaction("I2", "F2", ("IF5",), "element_synthesis", "iodine + fluorine -> iodine pentafluoride"),
+        CandidateReaction("I2", "Cl2", ("ICl",), "element_synthesis", "iodine + chlorine -> iodine monochloride"),
+    )
+    candidates.extend(nonmetal_binary_reactions)
+    return tuple(dict.fromkeys(candidates))
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Generate a 100k balance-checked binary reaction dataset.")
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--seed", type=int, default=SEED)
     parser.add_argument("--num-rows", type=int, default=NUM_ROWS)
     parser.add_argument("--max-scale", type=int, default=12)
-    parser.add_argument("--include-reversed-order", action="store_true", default=True)
+    parser.add_argument("--element-max-scale", type=int, default=DEFAULT_ELEMENT_MAX_SCALE)
+    parser.add_argument("--element-synthesis-fraction", type=float, default=DEFAULT_ELEMENT_SYNTHESIS_FRACTION)
+    parser.add_argument("--allow-stoichiometric-variations", action="store_true")
+    parser.add_argument("--include-reversed-order", action="store_true", default=False)
     parser.add_argument("--no-reversed-order", dest="include_reversed_order", action="store_false")
     return parser.parse_args()
 
@@ -234,7 +440,21 @@ def is_group1_or_ammonium(cation: Ion) -> bool:
 def is_soluble(cation: Ion, anion: Ion) -> bool:
     if is_group1_or_ammonium(cation):
         return True
-    if anion.formula in {"NO3", "NO2", "C2H3O2", "ClO3", "ClO4"}:
+    if anion.formula in {
+        "NO3",
+        "NO2",
+        "C2H3O2",
+        "ClO3",
+        "ClO4",
+        "MnO4",
+        "HSO4",
+        "H2PO4",
+        "BrO3",
+        "IO3",
+        "IO4",
+        "SCN",
+        "OCN",
+    }:
         return True
     if anion.formula in {"Cl", "Br", "I"}:
         return cation.formula not in {"Ag", "Pb"}
@@ -247,6 +467,10 @@ def is_soluble(cation: Ion, anion: Ion) -> bool:
     if anion.formula == "S":
         return is_group1_or_ammonium(cation) or cation.formula in {"Ca", "Sr", "Ba"}
     if anion.formula in {"CO3", "SO3", "C2O4", "CrO4", "PO4"}:
+        return is_group1_or_ammonium(cation)
+    if anion.formula in {"O", "N", "P", "Se", "Te", "H", "HPO4", "BO3", "SiO3", "SeO4", "S2O3", "MoO4", "WO4", "AsO4"}:
+        return is_group1_or_ammonium(cation)
+    if anion.formula in {"CN", "HCO3", "HSO3", "ClO"}:
         return is_group1_or_ammonium(cation)
     return False
 
@@ -344,6 +568,7 @@ def validate_balanced(reactants: tuple[str, ...], reactant_coeffs: tuple[int, ..
 
 def build_candidates() -> list[CandidateReaction]:
     candidates: list[CandidateReaction] = []
+    candidates.extend(element_synthesis_reactions())
     candidates.extend(SYNTHESIS_REACTIONS)
 
     for acid_anion in ACID_ANIONS:
@@ -367,10 +592,18 @@ def build_candidates() -> list[CandidateReaction]:
             if is_soluble(cation, anion):
                 soluble_salts.append((neutral_compound(cation, anion), cation, anion))
 
+    seen_salt_pairs: set[tuple[str, str]] = set()
+    double_displacement_count = 0
     for salt_1, cation_1, anion_1 in soluble_salts:
         for salt_2, cation_2, anion_2 in soluble_salts:
+            if double_displacement_count >= MAX_DOUBLE_DISPLACEMENT_CANDIDATES:
+                break
             if cation_1.formula == cation_2.formula or anion_1.formula == anion_2.formula:
                 continue
+            salt_pair_key = tuple(sorted((salt_1, salt_2)))
+            if salt_pair_key in seen_salt_pairs:
+                continue
+            seen_salt_pairs.add(salt_pair_key)
             product_1 = neutral_compound(cation_1, anion_2)
             product_2 = neutral_compound(cation_2, anion_1)
             product_1_soluble = is_soluble(cation_1, anion_2)
@@ -391,6 +624,9 @@ def build_candidates() -> list[CandidateReaction]:
                     "soluble salts exchange ions; retained only when at least one product is insoluble by standard solubility rules",
                 )
             )
+            double_displacement_count += 1
+        if double_displacement_count >= MAX_DOUBLE_DISPLACEMENT_CANDIDATES:
+            break
 
     return list(dict.fromkeys(candidates))
 
@@ -405,9 +641,17 @@ def format_equation(reactants: tuple[str, str], reactant_coeffs: tuple[int, int]
     return f"{left} -> {right}"
 
 
-def build_pool(*, max_scale: int, include_reversed_order: bool) -> list[dict[str, object]]:
+def build_pool(
+    *,
+    max_scale: int,
+    element_max_scale: int,
+    include_reversed_order: bool,
+    allow_stoichiometric_variations: bool,
+) -> list[dict[str, object]]:
     if max_scale < 1:
         raise ValueError("max_scale must be >= 1")
+    if element_max_scale < 1:
+        raise ValueError("element_max_scale must be >= 1")
     rows: list[dict[str, object]] = []
     seen: set[tuple[object, ...]] = set()
 
@@ -425,7 +669,11 @@ def build_pool(*, max_scale: int, include_reversed_order: bool) -> list[dict[str
         if include_reversed_order and reactants[0] != reactants[1]:
             input_orders.append(((reactants[1], reactants[0]), (reactant_coeffs[1], reactant_coeffs[0]), "reversed"))
 
-        for scale in range(1, max_scale + 1):
+        if allow_stoichiometric_variations:
+            scale_limit = element_max_scale if candidate.family == "element_synthesis" else max_scale
+        else:
+            scale_limit = 1
+        for scale in range(1, scale_limit + 1):
             scaled_product_coeffs = tuple(coeff * scale for coeff in product_coeffs)
             output_1 = products[0]
             output_2 = products[1] if len(products) > 1 else NULL_TOKEN
@@ -461,7 +709,7 @@ def build_pool(*, max_scale: int, include_reversed_order: bool) -> list[dict[str
                         "output_2": output_2,
                         "output_2_amount": output_2_amount,
                         "equation": format_equation(ordered_reactants, scaled_reactant_coeffs, products, scaled_product_coeffs),
-                        "family": candidate.family,
+                    "family": candidate.family,
                         "source_rule": candidate.source_rule,
                         "order": order,
                         "scale": scale,
@@ -471,14 +719,42 @@ def build_pool(*, max_scale: int, include_reversed_order: bool) -> list[dict[str
     return rows
 
 
-def build_rows(*, num_rows: int, max_scale: int, include_reversed_order: bool, seed: int) -> list[dict[str, object]]:
-    pool = build_pool(max_scale=max_scale, include_reversed_order=include_reversed_order)
+def build_rows(
+    *,
+    num_rows: int,
+    max_scale: int,
+    element_max_scale: int,
+    element_synthesis_fraction: float,
+    include_reversed_order: bool,
+    allow_stoichiometric_variations: bool,
+    seed: int,
+) -> list[dict[str, object]]:
+    if not 0.0 <= element_synthesis_fraction <= 1.0:
+        raise ValueError("element_synthesis_fraction must be in [0, 1]")
+    pool = build_pool(
+        max_scale=max_scale,
+        element_max_scale=element_max_scale,
+        include_reversed_order=include_reversed_order,
+        allow_stoichiometric_variations=allow_stoichiometric_variations,
+    )
+    element_pool = [row for row in pool if row["family"] == "element_synthesis"]
+    other_pool = [row for row in pool if row["family"] != "element_synthesis"]
+    requested_element_rows = round(num_rows * element_synthesis_fraction)
+    requested_other_rows = num_rows - requested_element_rows
+    if len(element_pool) < requested_element_rows:
+        requested_element_rows = len(element_pool)
+        requested_other_rows = num_rows - requested_element_rows
+    if len(other_pool) < requested_other_rows:
+        raise ValueError(
+            f"only generated {len(other_pool)} valid non-element rows, fewer than requested "
+            f"{requested_other_rows}; increase --max-scale or lower --element-synthesis-fraction"
+        )
     if len(pool) < num_rows:
         raise ValueError(
             f"only generated {len(pool)} valid rows, fewer than requested {num_rows}; increase --max-scale"
         )
     rng = random.Random(seed)
-    rows = rng.sample(pool, num_rows)
+    rows = rng.sample(element_pool, requested_element_rows) + rng.sample(other_pool, requested_other_rows)
     rng.shuffle(rows)
     for index, row in enumerate(rows):
         row["id"] = index
@@ -574,7 +850,10 @@ def main() -> None:
     rows = build_rows(
         num_rows=args.num_rows,
         max_scale=args.max_scale,
+        element_max_scale=args.element_max_scale,
+        element_synthesis_fraction=args.element_synthesis_fraction,
         include_reversed_order=args.include_reversed_order,
+        allow_stoichiometric_variations=args.allow_stoichiometric_variations,
         seed=args.seed,
     )
     vocab_rows, species_to_id, amount_to_id = build_vocab(rows)
@@ -591,7 +870,7 @@ def main() -> None:
     metadata = {
         "name": "reaction_combination_binary_two_output_100k",
         "scientific_scope": (
-            "Atom-balanced binary reactions generated from curated synthesis reactions, "
+            "Atom-balanced binary reactions generated from curated element-element synthesis reactions, "
             "acid-base neutralization templates, and standard aqueous solubility-rule precipitation templates."
         ),
         "target_design": "two_product_species_tokens",
@@ -612,7 +891,15 @@ def main() -> None:
         "single_output_rows_with_NULL": len(rows) - two_output_count,
         "seed": args.seed,
         "max_scale": args.max_scale,
+        "element_max_scale": args.element_max_scale,
+        "element_synthesis_fraction": args.element_synthesis_fraction,
+        "element_synthesis_rows": family_counts.get("element_synthesis", 0),
         "include_reversed_order": args.include_reversed_order,
+        "allow_stoichiometric_variations": args.allow_stoichiometric_variations,
+        "unique_reaction_policy": (
+            "Default generation writes each canonical reaction once: no reversed-order duplicates and no scaled "
+            "stoichiometric variants. Balanced base coefficients are still used as input amounts."
+        ),
         "validation": "Every accepted row is atom-balanced by formula parsing before it is written.",
     }
     with (args.output_dir / "metadata.json").open("w", encoding="utf-8") as file:
@@ -625,6 +912,7 @@ def main() -> None:
     print(f"Vocab size: {len(vocab_rows)}")
     print(f"Split counts: {dict(split_counts)}")
     print(f"Family counts: {dict(family_counts)}")
+    print(f"Element-synthesis rows: {family_counts.get('element_synthesis', 0)}")
     print(f"Two-output rows: {two_output_count}")
     print(f"Single-output rows with NULL: {len(rows) - two_output_count}")
     print("Example rows:")

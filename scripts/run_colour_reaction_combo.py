@@ -29,6 +29,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
     parser.add_argument("--parallel-workers", type=int, default=12)
     parser.add_argument("--max-steps", type=int, default=500000)
+    parser.add_argument(
+        "--checkpoint-schedule",
+        type=str,
+        default="staged",
+        choices=["staged", "fixed", "none"],
+        help="staged saves every 1k through 25k, then every --checkpoint-every-steps.",
+    )
     parser.add_argument("--checkpoint-every-steps", type=int, default=25000)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
@@ -40,6 +47,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--colour-num-base-colors", type=int, default=2000)
     parser.add_argument("--reaction-num-rows", type=int, default=100000)
     parser.add_argument("--reaction-max-scale", type=int, default=12)
+    parser.add_argument("--reaction-element-max-scale", type=int, default=1)
+    parser.add_argument("--reaction-element-synthesis-fraction", type=float, default=0.50)
     parser.add_argument("--poll-interval-sec", type=float, default=5.0)
     parser.add_argument("--progress-report-every-sec", type=float, default=30.0)
     return parser.parse_args()
@@ -89,7 +98,7 @@ def colour_command(args: argparse.Namespace, workers: int) -> list[str]:
         "--log-every",
         str(args.log_every),
         "--checkpoint-schedule",
-        "fixed",
+        args.checkpoint_schedule,
         "--checkpoint-every-steps",
         str(args.checkpoint_every_steps),
         "--batch-size",
@@ -122,6 +131,8 @@ def chemistry_command(args: argparse.Namespace, workers: int) -> list[str]:
         str(args.eval_every),
         "--log-every",
         str(args.log_every),
+        "--checkpoint-schedule",
+        args.checkpoint_schedule,
         "--checkpoint-every-steps",
         str(args.checkpoint_every_steps),
         "--batch-size",
@@ -138,6 +149,10 @@ def chemistry_command(args: argparse.Namespace, workers: int) -> list[str]:
         str(args.reaction_num_rows),
         "--max-scale",
         str(args.reaction_max_scale),
+        "--element-max-scale",
+        str(args.reaction_element_max_scale),
+        "--element-synthesis-fraction",
+        str(args.reaction_element_synthesis_fraction),
     ]
 
 
@@ -160,11 +175,15 @@ def write_manifest(args: argparse.Namespace, colour_workers: int, chemistry_work
         "batch_size": args.batch_size,
         "learning_rate": args.learning_rate,
         "weight_decay": args.weight_decay,
+        "full_train_eval_logged": True,
         "eval_every": args.eval_every,
         "log_every": args.log_every,
+        "checkpoint_schedule": args.checkpoint_schedule,
         "poll_interval_sec": args.poll_interval_sec,
         "progress_report_every_sec": args.progress_report_every_sec,
         "dataset_seed": args.dataset_seed,
+        "reaction_element_synthesis_fraction": args.reaction_element_synthesis_fraction,
+        "reaction_element_max_scale": args.reaction_element_max_scale,
     }
     (args.output_root / "combined_manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
 
@@ -210,6 +229,10 @@ def discover_run_progress(output_root: Path) -> list[dict[str, object]]:
                     "max_steps": max_steps,
                     "progress_fraction": 1.0 if max_steps <= 0 else min(max(step / max_steps, 0.0), 1.0),
                     "path": progress_path,
+                    "train_label_accuracy": payload.get("train_label_accuracy"),
+                    "train_exact_match_accuracy": payload.get("train_exact_match_accuracy"),
+                    "test_label_accuracy": payload.get("test_label_accuracy"),
+                    "test_exact_match_accuracy": payload.get("test_exact_match_accuracy"),
                 }
             )
     return records
@@ -221,10 +244,22 @@ def format_run_progress(record: dict[str, object]) -> str:
     status = str(record["status"])
     run_name = str(record["run_name"])
     suite = str(record["suite"])
+    metric_parts: list[str] = []
+    for key, label in (
+        ("train_label_accuracy", "train_acc"),
+        ("train_exact_match_accuracy", "train_exact"),
+        ("test_label_accuracy", "test_acc"),
+        ("test_exact_match_accuracy", "test_exact"),
+    ):
+        value = record.get(key)
+        if isinstance(value, (int, float)):
+            metric_parts.append(f"{label}={value:.3f}")
     if max_steps <= 0:
-        return f"{suite}/{run_name} {status} step={step}"
+        base = f"{suite}/{run_name} {status} step={step}"
+        return f"{base} {' '.join(metric_parts)}".rstrip()
     percent = 100.0 * step / max_steps
-    return f"{suite}/{run_name} {status} {step}/{max_steps} ({percent:.1f}%)"
+    base = f"{suite}/{run_name} {status} {step}/{max_steps} ({percent:.1f}%)"
+    return f"{base} {' '.join(metric_parts)}".rstrip()
 
 
 def print_progress_snapshot(output_root: Path, *, total_runs: int, show_completed: bool = False) -> int:
