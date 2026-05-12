@@ -49,6 +49,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--reaction-max-scale", type=int, default=12)
     parser.add_argument("--reaction-element-max-scale", type=int, default=1)
     parser.add_argument("--reaction-element-synthesis-fraction", type=float, default=0.50)
+    parser.add_argument("--reaction-no-reaction-fraction", type=float, default=0.25)
+    parser.add_argument("--reaction-split-strategy", choices=["generalization", "random"], default="generalization")
     parser.add_argument("--poll-interval-sec", type=float, default=5.0)
     parser.add_argument("--progress-report-every-sec", type=float, default=30.0)
     return parser.parse_args()
@@ -153,6 +155,10 @@ def chemistry_command(args: argparse.Namespace, workers: int) -> list[str]:
         str(args.reaction_element_max_scale),
         "--element-synthesis-fraction",
         str(args.reaction_element_synthesis_fraction),
+        "--no-reaction-fraction",
+        str(args.reaction_no_reaction_fraction),
+        "--split-strategy",
+        args.reaction_split_strategy,
     ]
 
 
@@ -183,6 +189,8 @@ def write_manifest(args: argparse.Namespace, colour_workers: int, chemistry_work
         "progress_report_every_sec": args.progress_report_every_sec,
         "dataset_seed": args.dataset_seed,
         "reaction_element_synthesis_fraction": args.reaction_element_synthesis_fraction,
+        "reaction_no_reaction_fraction": args.reaction_no_reaction_fraction,
+        "reaction_split_strategy": args.reaction_split_strategy,
         "reaction_element_max_scale": args.reaction_element_max_scale,
     }
     (args.output_root / "combined_manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")

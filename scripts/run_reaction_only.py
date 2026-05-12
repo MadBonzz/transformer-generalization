@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import subprocess
 import sys
 from pathlib import Path
@@ -28,6 +29,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-scale", type=int, default=12)
     parser.add_argument("--element-max-scale", type=int, default=1)
     parser.add_argument("--element-synthesis-fraction", type=float, default=0.50)
+    parser.add_argument("--no-reaction-fraction", type=float, default=0.25)
+    parser.add_argument("--split-strategy", choices=["generalization", "random"], default="generalization")
     parser.add_argument("--poll-interval-sec", type=float, default=5.0)
     return parser.parse_args()
 
@@ -69,13 +72,32 @@ def build_command(args: argparse.Namespace) -> list[str]:
         str(args.element_max_scale),
         "--element-synthesis-fraction",
         str(args.element_synthesis_fraction),
+        "--no-reaction-fraction",
+        str(args.no_reaction_fraction),
+        "--split-strategy",
+        args.split_strategy,
         "--poll-interval-sec",
         str(args.poll_interval_sec),
     ]
 
 
+def validate_requested_device(device: str) -> None:
+    if device != "cuda":
+        return
+    if importlib.util.find_spec("torch") is None:
+        raise SystemExit("CUDA was requested, but PyTorch is not installed in this environment.")
+    import torch
+
+    if not torch.cuda.is_available():
+        raise SystemExit(
+            "CUDA was requested with --device cuda, but torch.cuda.is_available() is false. "
+            "Check `nvidia-smi`, the cloud instance GPU attachment, and whether this environment has a CUDA PyTorch build."
+        )
+
+
 def main() -> None:
     args = parse_args()
+    validate_requested_device(args.device)
     command = build_command(args)
     print(" ".join(command), flush=True)
     raise SystemExit(subprocess.call(command, cwd=ROOT_DIR))

@@ -13,10 +13,12 @@ Examples:
 ```text
 HCl 1 NaOH 1 -> NaCl H2O
 H2 1 Cl2 1 -> HCl NULL
+F2 1 Cl2 1 -> NULL NULL
 ```
 
 `NULL` is an explicit species token used when the reaction has only one product
-species. Product stoichiometric coefficients are stored in the CSV as
+species, and `NULL NULL` is used for explicit no-net-reaction examples. Product
+stoichiometric coefficients are stored in the CSV as
 `output_1_amount` and `output_2_amount`, but the model target is only the two
 product species tokens. This keeps the input context fixed at 4 tokens and the
 target fixed at 2 tokens.
@@ -25,13 +27,20 @@ The dataset is generated from:
 
 - curated binary element-element synthesis reactions,
 - curated single-product synthesis reactions,
+- metal single-displacement reactions from a conservative activity series,
+- halogen-displacement reactions,
+- active metal + non-oxidizing acid reactions,
+- simple hydrocarbon combustion reactions,
 - acid-base neutralization templates,
-- aqueous double-displacement reactions filtered by standard solubility rules.
+- aqueous double-displacement reactions filtered by standard solubility rules,
+- explicit no-net-reaction controls, including soluble spectator salt pairs,
+  non-displacing metal/salt pairs, and selected element pairs.
 
-Every accepted row is atom-balanced by parsing the formulas and validating atom
-counts before it is written. By default, each canonical reaction is written once:
-there are no scaled stoichiometric variants and no reversed-order duplicate
-inputs. The dataset is deterministic with seed `42`.
+Every positive accepted row is atom-balanced by parsing the formulas and
+validating atom counts before it is written. No-reaction rows are validated by
+requiring both outputs to be `NULL`. By default, each canonical reaction is
+written once: there are no scaled stoichiometric variants and no reversed-order
+duplicate inputs. The dataset is deterministic with seed `42`.
 
 Generate the dataset:
 
@@ -56,16 +65,27 @@ Default dataset shape:
 
 - `100,000` examples.
 - `50%` train, `25%` validation, `25%` test.
+- the default split strategy holds out whole chemistry groups so a `split_group`
+  does not appear in more than one split.
 - `4` input tokens: reactant species, amount, reactant species, amount.
 - `2` output tokens: product species, product species-or-`NULL`.
 - about `2.5k` species tokens including `NULL` in the current default generation.
-- about `8` amount tokens in the current default generation.
+- about `10` amount tokens in the current default generation.
 - about `600` unique element-element synthesis rows in the current default generation.
+- `25%` no-reaction rows by default.
 
 To change size while keeping deterministic sampling:
 
 ```bash
 python reaction-combination/generate_reaction_dataset.py --num-rows 100000 --seed 42
+```
+
+Useful controls:
+
+```bash
+python reaction-combination/generate_reaction_dataset.py \
+  --no-reaction-fraction 0.25 \
+  --split-strategy generalization
 ```
 
 Run the baseline experiment:

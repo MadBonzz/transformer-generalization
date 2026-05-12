@@ -141,6 +141,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-scale", type=int, default=12)
     parser.add_argument("--element-max-scale", type=int, default=1)
     parser.add_argument("--element-synthesis-fraction", type=float, default=0.50)
+    parser.add_argument("--no-reaction-fraction", type=float, default=0.25)
+    parser.add_argument("--split-strategy", choices=["generalization", "random"], default="generalization")
     parser.add_argument("--parallel-workers", type=int, default=1)
     parser.add_argument("--poll-interval-sec", type=float, default=2.0)
     parser.add_argument("--launch-settle-sec", type=float, default=1.0)
@@ -154,6 +156,15 @@ def resolve_device(device: str) -> str:
     if device == "auto":
         return "cuda" if torch.cuda.is_available() else "cpu"
     return device
+
+
+def validate_requested_device(device: str) -> None:
+    if device == "cuda" and not torch.cuda.is_available():
+        raise SystemExit(
+            "CUDA was requested with --device cuda, but torch.cuda.is_available() is false. "
+            "This machine/container does not expose a CUDA GPU to PyTorch. "
+            "Check `nvidia-smi` and the installed PyTorch CUDA build, or rerun with --device auto/--device cpu."
+        )
 
 
 def staged_checkpoint_steps(max_steps: int, interval_after_early: int) -> tuple[int, ...]:
@@ -210,6 +221,10 @@ def generate_dataset(args: argparse.Namespace, dataset_dir: Path) -> None:
             str(args.element_max_scale),
             "--element-synthesis-fraction",
             str(args.element_synthesis_fraction),
+            "--no-reaction-fraction",
+            str(args.no_reaction_fraction),
+            "--split-strategy",
+            str(args.split_strategy),
         ],
         check=False,
         stdout=subprocess.PIPE,
@@ -331,11 +346,16 @@ def validate_dataset(dataset_dir: Path) -> dict[str, object]:
             else:
                 two_output_rows += 1
 
-            lhs, rhs = row["equation"].split("->")
-            reactants, reactant_coeffs = parse_equation_side(lhs)
-            products, product_coeffs = parse_equation_side(rhs)
-            if atom_counts(reactants, reactant_coeffs) != atom_counts(products, product_coeffs):
-                raise ValueError(f"unbalanced row: {row['equation']}")
+            is_no_reaction = family.startswith("no_reaction")
+            if is_no_reaction:
+                if row["output_1"] != NULL_TOKEN or row["output_2"] != NULL_TOKEN:
+                    raise ValueError(f"no-reaction row must target NULL NULL: {row}")
+            else:
+                lhs, rhs = row["equation"].split("->")
+                reactants, reactant_coeffs = parse_equation_side(lhs)
+                products, product_coeffs = parse_equation_side(rhs)
+                if atom_counts(reactants, reactant_coeffs) != atom_counts(products, product_coeffs):
+                    raise ValueError(f"unbalanced row: {row['equation']}")
 
     expected_rows = int(metadata["num_examples"])
     if row_count != expected_rows:
@@ -354,13 +374,14 @@ def validate_dataset(dataset_dir: Path) -> dict[str, object]:
         "two_output_rows": two_output_rows,
         "single_output_rows_with_NULL": null_rows,
         "family_counts": family_counts,
+        "no_reaction_rows_with_NULL_NULL": sum(count for family, count in family_counts.items() if family.startswith("no_reaction")),
         "element_synthesis_rows": element_synthesis_rows,
         "unique_element_reactant_tokens_in_element_synthesis": len(element_reactant_species),
         "null_token_id": species_to_id[NULL_TOKEN],
         "tokenization": "Each full element/molecule formula is one species token ID; formulas are not split into atom/subformula tokens.",
         "chemistry_grounding": (
-            "Every CSV row is generated from curated element-element synthesis, acid-base neutralization, "
-            "or solubility-rule double-displacement templates, and every written equation is atom-balance validated."
+            "Positive CSV rows are generated from curated reaction templates and atom-balance validated. "
+            "No-reaction CSV rows are generated from conservative no-net-reaction templates and target NULL NULL."
         ),
     }
     write_json(dataset_dir / "dataset_validation.json", validation)
@@ -632,6 +653,9 @@ def run_one(args: argparse.Namespace, *, layers: int, seed: int) -> dict[str, ob
             "target_design": metadata["target_design"],
             "element_synthesis_fraction": metadata.get("element_synthesis_fraction"),
             "element_synthesis_rows": metadata.get("element_synthesis_rows"),
+            "no_reaction_fraction": metadata.get("no_reaction_fraction"),
+            "no_reaction_rows_with_NULL_NULL": metadata.get("no_reaction_rows_with_NULL_NULL"),
+            "split_strategy": metadata.get("split_strategy"),
         },
     )
 
@@ -927,6 +951,10 @@ def single_run_command(args: argparse.Namespace, *, layers: int, seed: int, data
         str(args.element_max_scale),
         "--element-synthesis-fraction",
         str(args.element_synthesis_fraction),
+        "--no-reaction-fraction",
+        str(args.no_reaction_fraction),
+        "--split-strategy",
+        str(args.split_strategy),
     ]
 
 
@@ -1045,6 +1073,7 @@ def run_parallel(args: argparse.Namespace, jobs: list[tuple[int, int]], dataset_
 
 def main() -> None:
     args = parse_args()
+    validate_requested_device(args.device)
     args.output_root.mkdir(parents=True, exist_ok=True)
     args.dataset_dir = resolve_dataset_dir(args)
 

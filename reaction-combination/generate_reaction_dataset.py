@@ -21,6 +21,8 @@ NULL_TOKEN = "NULL"
 DEFAULT_ELEMENT_SYNTHESIS_FRACTION = 0.50
 DEFAULT_ELEMENT_MAX_SCALE = 1
 MAX_DOUBLE_DISPLACEMENT_CANDIDATES = 140_000
+MAX_NO_REACTION_CANDIDATES = 80_000
+DEFAULT_NO_REACTION_FRACTION = 0.25
 
 
 @dataclass(frozen=True)
@@ -163,6 +165,11 @@ ACID_ANIONS: tuple[Ion, ...] = (
     Ion("C2O4", -2, "acid"),
     Ion("CrO4", -2, "acid"),
     Ion("PO4", -3, "acid"),
+    Ion("HCO3", -1, "acid"),
+    Ion("HSO4", -1, "acid"),
+    Ion("HSO3", -1, "acid"),
+    Ion("H2PO4", -1, "acid"),
+    Ion("HPO4", -2, "acid"),
 )
 
 BASE_CATIONS: tuple[Ion, ...] = (
@@ -175,6 +182,10 @@ BASE_CATIONS: tuple[Ion, ...] = (
     Ion("Ca", 2, "base"),
     Ion("Sr", 2, "base"),
     Ion("Ba", 2, "base"),
+    Ion("Zn", 2, "base"),
+    Ion("Fe", 2, "base"),
+    Ion("Cu", 2, "base"),
+    Ion("Al", 3, "base"),
 )
 
 SYNTHESIS_REACTIONS: tuple[CandidateReaction, ...] = (
@@ -335,14 +346,19 @@ def element_synthesis_reactions() -> tuple[CandidateReaction, ...]:
         CandidateReaction("Si", "F2", ("SiF4",), "element_synthesis", "silicon + fluorine -> silicon tetrafluoride"),
         CandidateReaction("B", "Cl2", ("BCl3",), "element_synthesis", "boron + chlorine -> boron trichloride"),
         CandidateReaction("B", "F2", ("BF3",), "element_synthesis", "boron + fluorine -> boron trifluoride"),
-        CandidateReaction("Cl2", "F2", ("ClF",), "element_synthesis", "chlorine + fluorine -> chlorine monofluoride"),
-        CandidateReaction("Cl2", "F2", ("ClF3",), "element_synthesis", "chlorine + fluorine -> chlorine trifluoride"),
-        CandidateReaction("Br2", "F2", ("BrF3",), "element_synthesis", "bromine + fluorine -> bromine trifluoride"),
-        CandidateReaction("I2", "F2", ("IF5",), "element_synthesis", "iodine + fluorine -> iodine pentafluoride"),
-        CandidateReaction("I2", "Cl2", ("ICl",), "element_synthesis", "iodine + chlorine -> iodine monochloride"),
     )
     candidates.extend(nonmetal_binary_reactions)
     return tuple(dict.fromkeys(candidates))
+
+
+COMBUSTION_REACTIONS: tuple[CandidateReaction, ...] = (
+    CandidateReaction("CH4", "O2", ("CO2", "H2O"), "combustion", "hydrocarbon + oxygen -> carbon dioxide + water"),
+    CandidateReaction("C2H6", "O2", ("CO2", "H2O"), "combustion", "hydrocarbon + oxygen -> carbon dioxide + water"),
+    CandidateReaction("C2H4", "O2", ("CO2", "H2O"), "combustion", "hydrocarbon + oxygen -> carbon dioxide + water"),
+    CandidateReaction("C2H2", "O2", ("CO2", "H2O"), "combustion", "hydrocarbon + oxygen -> carbon dioxide + water"),
+    CandidateReaction("C3H8", "O2", ("CO2", "H2O"), "combustion", "hydrocarbon + oxygen -> carbon dioxide + water"),
+    CandidateReaction("C4H10", "O2", ("CO2", "H2O"), "combustion", "hydrocarbon + oxygen -> carbon dioxide + water"),
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -353,6 +369,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-scale", type=int, default=12)
     parser.add_argument("--element-max-scale", type=int, default=DEFAULT_ELEMENT_MAX_SCALE)
     parser.add_argument("--element-synthesis-fraction", type=float, default=DEFAULT_ELEMENT_SYNTHESIS_FRACTION)
+    parser.add_argument("--no-reaction-fraction", type=float, default=DEFAULT_NO_REACTION_FRACTION)
+    parser.add_argument("--split-strategy", choices=["generalization", "random"], default="generalization")
     parser.add_argument("--allow-stoichiometric-variations", action="store_true")
     parser.add_argument("--include-reversed-order", action="store_true", default=False)
     parser.add_argument("--no-reversed-order", dest="include_reversed_order", action="store_false")
@@ -475,6 +493,261 @@ def is_soluble(cation: Ion, anion: Ion) -> bool:
     return False
 
 
+def canonical_pair(left: str, right: str) -> tuple[str, str]:
+    return tuple(sorted((left, right)))
+
+
+def common_cation_by_formula() -> dict[str, Ion]:
+    preferred_charges = {
+        "Li": 1,
+        "Na": 1,
+        "K": 1,
+        "Rb": 1,
+        "Cs": 1,
+        "Mg": 2,
+        "Ca": 2,
+        "Sr": 2,
+        "Ba": 2,
+        "Cr": 3,
+        "Mn": 2,
+        "Co": 2,
+        "Al": 3,
+        "Zn": 2,
+        "Fe": 2,
+        "Ni": 2,
+        "Sn": 2,
+        "Pb": 2,
+        "Cu": 2,
+        "Hg": 2,
+        "Cd": 2,
+        "Ag": 1,
+    }
+    by_formula: dict[str, Ion] = {}
+    for cation in CATIONS:
+        if cation.formula in preferred_charges and cation.charge == preferred_charges[cation.formula]:
+            by_formula[cation.formula] = cation
+    return by_formula
+
+
+def soluble_salt_pool() -> list[tuple[str, Ion, Ion]]:
+    salts = []
+    for cation in CATIONS:
+        for anion in ANIONS:
+            if is_soluble(cation, anion):
+                salts.append((neutral_compound(cation, anion), cation, anion))
+    return salts
+
+
+def single_displacement_reactions() -> list[CandidateReaction]:
+    """Metal activity-series single-displacement reactions.
+
+    A more reactive free metal displaces a less reactive metal cation from a salt.
+    The set is intentionally conservative and uses common aqueous lab examples.
+    """
+
+    activity = ["Mg", "Al", "Mn", "Zn", "Cr", "Fe", "Co", "Ni", "Sn", "Pb", "Cu", "Hg", "Ag"]
+    rank = {metal: index for index, metal in enumerate(activity)}
+    cations = common_cation_by_formula()
+    salt_anions = (
+        Ion("NO3", -1, "nitrate"),
+        Ion("SO4", -2, "sulfate"),
+        Ion("Cl", -1, "halide"),
+        Ion("Br", -1, "halide"),
+        Ion("I", -1, "halide"),
+        Ion("C2H3O2", -1, "acetate"),
+        Ion("ClO3", -1, "chlorate"),
+        Ion("ClO4", -1, "perchlorate"),
+    )
+    candidates: list[CandidateReaction] = []
+    for incoming in activity:
+        incoming_cation = cations[incoming]
+        for displaced in activity:
+            if rank[incoming] >= rank[displaced]:
+                continue
+            displaced_cation = cations[displaced]
+            for anion in salt_anions:
+                salt = neutral_compound(displaced_cation, anion)
+                product_salt = neutral_compound(incoming_cation, anion)
+                candidates.append(
+                    CandidateReaction(
+                        incoming,
+                        salt,
+                        (product_salt, displaced),
+                        "single_displacement_metal",
+                        "more reactive metal + metal salt -> new salt + displaced metal",
+                    )
+                )
+    return candidates
+
+
+def halogen_displacement_reactions() -> list[CandidateReaction]:
+    """Halogen activity-series reactions: F2 > Cl2 > Br2 > I2."""
+
+    halogens = [
+        ("F2", Ion("F", -1, "halide")),
+        ("Cl2", Ion("Cl", -1, "halide")),
+        ("Br2", Ion("Br", -1, "halide")),
+        ("I2", Ion("I", -1, "halide")),
+    ]
+    halogen_salt_metals = {
+        "Li",
+        "Na",
+        "K",
+        "Rb",
+        "Cs",
+        "Mg",
+        "Ca",
+        "Sr",
+        "Ba",
+        "Zn",
+        "Fe",
+        "Cu",
+        "Ni",
+        "Co",
+        "Mn",
+        "Sn",
+        "Pb",
+        "Cd",
+        "Hg",
+        "Ag",
+    }
+    cations = tuple(cation for cation in CATIONS if cation.formula in halogen_salt_metals)
+    candidates: list[CandidateReaction] = []
+    for incoming_index, (incoming_species, incoming_anion) in enumerate(halogens):
+        for displaced_species, displaced_anion in halogens[incoming_index + 1 :]:
+            for cation in cations:
+                salt = neutral_compound(cation, displaced_anion)
+                product_salt = neutral_compound(cation, incoming_anion)
+                candidates.append(
+                    CandidateReaction(
+                        incoming_species,
+                        salt,
+                        (product_salt, displaced_species),
+                        "halogen_displacement",
+                        "more reactive halogen + halide salt -> new halide salt + displaced halogen",
+                    )
+                )
+    return candidates
+
+
+def acid_metal_reactions() -> list[CandidateReaction]:
+    """Active metal + non-oxidizing acid -> salt + hydrogen gas."""
+
+    cations = common_cation_by_formula()
+    active_metals = ("Mg", "Al", "Mn", "Zn", "Cr", "Fe", "Co", "Ni", "Sn")
+    acid_anions = (
+        Ion("Cl", -1, "acid"),
+        Ion("Br", -1, "acid"),
+        Ion("I", -1, "acid"),
+        Ion("SO4", -2, "acid"),
+        Ion("C2H3O2", -1, "acid"),
+    )
+    candidates: list[CandidateReaction] = []
+    for metal in active_metals:
+        if metal not in cations:
+            continue
+        for anion in acid_anions:
+            candidates.append(
+                CandidateReaction(
+                    metal,
+                    acid_formula(anion),
+                    (neutral_compound(cations[metal], anion), "H2"),
+                    "acid_metal",
+                    "active metal + non-oxidizing acid -> salt + hydrogen",
+                )
+            )
+    return candidates
+
+
+def no_reaction_candidates(positive_pairs: set[tuple[str, str]]) -> list[CandidateReaction]:
+    """Conservative no-net-reaction examples under the generator's chemistry rules."""
+
+    candidates: list[CandidateReaction] = []
+
+    # Soluble aqueous salt pairs where double displacement leaves all ions soluble.
+    salts = soluble_salt_pool()
+    count = 0
+    seen_no_reaction_pairs: set[tuple[str, str]] = set()
+    for salt_1, cation_1, anion_1 in salts:
+        for salt_2, cation_2, anion_2 in salts:
+            if count >= MAX_NO_REACTION_CANDIDATES:
+                break
+            if cation_1.formula == cation_2.formula or anion_1.formula == anion_2.formula:
+                continue
+            pair = canonical_pair(salt_1, salt_2)
+            if pair in positive_pairs or pair in seen_no_reaction_pairs:
+                continue
+            seen_no_reaction_pairs.add(pair)
+            product_1_soluble = is_soluble(cation_1, anion_2)
+            product_2_soluble = is_soluble(cation_2, anion_1)
+            if product_1_soluble and product_2_soluble:
+                candidates.append(
+                    CandidateReaction(
+                        salt_1,
+                        salt_2,
+                        (),
+                        "no_reaction_aqueous_spectator",
+                        "soluble salt pair; no precipitate, gas, or weak electrolyte forms",
+                    )
+                )
+                count += 1
+        if count >= MAX_NO_REACTION_CANDIDATES:
+            break
+
+    # Element pairs with no ordinary binary reaction in this curated rule scope.
+    element_pairs = (
+        ("F2", "Cl2"),
+        ("F2", "Br2"),
+        ("F2", "I2"),
+        ("Cl2", "Br2"),
+        ("Cl2", "I2"),
+        ("Br2", "I2"),
+        ("N2", "O2"),
+        ("N2", "Cl2"),
+        ("N2", "Br2"),
+        ("O2", "Cl2"),
+        ("O2", "Br2"),
+        ("H2", "N2"),
+    )
+    for left, right in element_pairs:
+        if canonical_pair(left, right) not in positive_pairs:
+            candidates.append(
+                CandidateReaction(
+                    left,
+                    right,
+                    (),
+                    "no_reaction_element_pair",
+                    "no ordinary binary reaction under the dataset's standard-condition rule scope",
+                )
+            )
+
+    # Metals that are not reactive enough to displace the salt cation.
+    activity = ["Mg", "Al", "Mn", "Zn", "Cr", "Fe", "Co", "Ni", "Sn", "Pb", "Cu", "Hg", "Ag"]
+    rank = {metal: index for index, metal in enumerate(activity)}
+    cations = common_cation_by_formula()
+    anions = (Ion("NO3", -1, "nitrate"), Ion("SO4", -2, "sulfate"), Ion("Cl", -1, "halide"))
+    for incoming in activity:
+        for protected in activity:
+            if rank[incoming] < rank[protected]:
+                continue
+            if incoming == protected:
+                continue
+            for anion in anions:
+                salt = neutral_compound(cations[protected], anion)
+                if canonical_pair(incoming, salt) in positive_pairs:
+                    continue
+                candidates.append(
+                    CandidateReaction(
+                        incoming,
+                        salt,
+                        (),
+                        "no_reaction_single_displacement",
+                        "metal is not reactive enough to displace the salt cation",
+                    )
+                )
+    return candidates
+
+
 def build_count_matrix(reactants: tuple[str, ...], products: tuple[str, ...]) -> tuple[list[str], list[list[Fraction]]]:
     elements = sorted(set().union(*(species_counts(species).keys() for species in (*reactants, *products))))
     species = (*reactants, *products)
@@ -567,16 +840,20 @@ def validate_balanced(reactants: tuple[str, ...], reactant_coeffs: tuple[int, ..
 
 
 def build_candidates() -> list[CandidateReaction]:
-    candidates: list[CandidateReaction] = []
-    candidates.extend(element_synthesis_reactions())
-    candidates.extend(SYNTHESIS_REACTIONS)
+    positive_candidates: list[CandidateReaction] = []
+    positive_candidates.extend(element_synthesis_reactions())
+    positive_candidates.extend(SYNTHESIS_REACTIONS)
+    positive_candidates.extend(COMBUSTION_REACTIONS)
+    positive_candidates.extend(single_displacement_reactions())
+    positive_candidates.extend(halogen_displacement_reactions())
+    positive_candidates.extend(acid_metal_reactions())
 
     for acid_anion in ACID_ANIONS:
         acid = acid_formula(acid_anion)
         for base_cation in BASE_CATIONS:
             base = neutral_compound(base_cation, Ion("OH", -1, "hydroxide"))
             salt = neutral_compound(base_cation, acid_anion)
-            candidates.append(
+            positive_candidates.append(
                 CandidateReaction(
                     acid,
                     base,
@@ -586,11 +863,7 @@ def build_candidates() -> list[CandidateReaction]:
                 )
             )
 
-    soluble_salts = []
-    for cation in CATIONS:
-        for anion in ANIONS:
-            if is_soluble(cation, anion):
-                soluble_salts.append((neutral_compound(cation, anion), cation, anion))
+    soluble_salts = soluble_salt_pool()
 
     seen_salt_pairs: set[tuple[str, str]] = set()
     double_displacement_count = 0
@@ -615,7 +888,7 @@ def build_candidates() -> list[CandidateReaction]:
                 products = (product_2, product_1)
             elif not product_1_soluble and not product_2_soluble and product_2 < product_1:
                 products = (product_2, product_1)
-            candidates.append(
+            positive_candidates.append(
                 CandidateReaction(
                     salt_1,
                     salt_2,
@@ -628,6 +901,9 @@ def build_candidates() -> list[CandidateReaction]:
         if double_displacement_count >= MAX_DOUBLE_DISPLACEMENT_CANDIDATES:
             break
 
+    positive_candidates = list(dict.fromkeys(positive_candidates))
+    positive_pairs = {canonical_pair(candidate.reactant_1, candidate.reactant_2) for candidate in positive_candidates}
+    candidates = positive_candidates + no_reaction_candidates(positive_pairs)
     return list(dict.fromkeys(candidates))
 
 
@@ -637,7 +913,7 @@ def format_term(amount: int, species: str) -> str:
 
 def format_equation(reactants: tuple[str, str], reactant_coeffs: tuple[int, int], products: tuple[str, ...], product_coeffs: tuple[int, ...]) -> str:
     left = " + ".join(format_term(coeff, species) for species, coeff in zip(reactants, reactant_coeffs))
-    right = " + ".join(format_term(coeff, species) for species, coeff in zip(products, product_coeffs))
+    right = " + ".join(format_term(coeff, species) for species, coeff in zip(products, product_coeffs)) if products else f"{NULL_TOKEN} + {NULL_TOKEN}"
     return f"{left} -> {right}"
 
 
@@ -658,6 +934,36 @@ def build_pool(
     for candidate in build_candidates():
         reactants = (candidate.reactant_1, candidate.reactant_2)
         products = candidate.products
+        if not products:
+            input_orders = [(reactants, (1, 1), "canonical")]
+            if include_reversed_order and reactants[0] != reactants[1]:
+                input_orders.append(((reactants[1], reactants[0]), (1, 1), "reversed"))
+            for ordered_reactants, ordered_coeffs, order in input_orders:
+                key = (ordered_reactants[0], 1, ordered_reactants[1], 1, NULL_TOKEN, NULL_TOKEN)
+                if key in seen:
+                    continue
+                seen.add(key)
+                rows.append(
+                    {
+                        "reactant_1": ordered_reactants[0],
+                        "amount_1": ordered_coeffs[0],
+                        "reactant_2": ordered_reactants[1],
+                        "amount_2": ordered_coeffs[1],
+                        "output_1": NULL_TOKEN,
+                        "output_1_amount": 0,
+                        "output_2": NULL_TOKEN,
+                        "output_2_amount": 0,
+                        "equation": format_equation(ordered_reactants, ordered_coeffs, (), ()),
+                        "family": candidate.family,
+                        "source_rule": candidate.source_rule,
+                        "order": order,
+                        "scale": 1,
+                        "note": candidate.note,
+                        "split_group": f"{candidate.family}:{'|'.join(canonical_pair(*ordered_reactants))}",
+                    }
+                )
+            continue
+
         coeffs = balance_coefficients(reactants, products)
         if coeffs is None:
             continue
@@ -709,11 +1015,12 @@ def build_pool(
                         "output_2": output_2,
                         "output_2_amount": output_2_amount,
                         "equation": format_equation(ordered_reactants, scaled_reactant_coeffs, products, scaled_product_coeffs),
-                    "family": candidate.family,
+                        "family": candidate.family,
                         "source_rule": candidate.source_rule,
                         "order": order,
                         "scale": scale,
                         "note": candidate.note,
+                        "split_group": f"{candidate.family}:{'|'.join(canonical_pair(*ordered_reactants))}->{'|'.join(products)}",
                     }
                 )
     return rows
@@ -725,41 +1032,186 @@ def build_rows(
     max_scale: int,
     element_max_scale: int,
     element_synthesis_fraction: float,
+    no_reaction_fraction: float,
+    split_strategy: str,
     include_reversed_order: bool,
     allow_stoichiometric_variations: bool,
     seed: int,
 ) -> list[dict[str, object]]:
     if not 0.0 <= element_synthesis_fraction <= 1.0:
         raise ValueError("element_synthesis_fraction must be in [0, 1]")
+    if not 0.0 <= no_reaction_fraction <= 1.0:
+        raise ValueError("no_reaction_fraction must be in [0, 1]")
     pool = build_pool(
         max_scale=max_scale,
         element_max_scale=element_max_scale,
         include_reversed_order=include_reversed_order,
         allow_stoichiometric_variations=allow_stoichiometric_variations,
     )
-    element_pool = [row for row in pool if row["family"] == "element_synthesis"]
-    other_pool = [row for row in pool if row["family"] != "element_synthesis"]
-    requested_element_rows = round(num_rows * element_synthesis_fraction)
-    requested_other_rows = num_rows - requested_element_rows
-    if len(element_pool) < requested_element_rows:
-        requested_element_rows = len(element_pool)
-        requested_other_rows = num_rows - requested_element_rows
-    if len(other_pool) < requested_other_rows:
-        raise ValueError(
-            f"only generated {len(other_pool)} valid non-element rows, fewer than requested "
-            f"{requested_other_rows}; increase --max-scale or lower --element-synthesis-fraction"
-        )
     if len(pool) < num_rows:
         raise ValueError(
             f"only generated {len(pool)} valid rows, fewer than requested {num_rows}; increase --max-scale"
         )
     rng = random.Random(seed)
-    rows = rng.sample(element_pool, requested_element_rows) + rng.sample(other_pool, requested_other_rows)
+    rows = sample_rows_by_family(
+        pool,
+        num_rows=num_rows,
+        element_synthesis_fraction=element_synthesis_fraction,
+        no_reaction_fraction=no_reaction_fraction,
+        rng=rng,
+    )
+    if split_strategy == "generalization":
+        assign_generalization_splits(rows, rng=random.Random(seed + 10_000))
+    elif split_strategy == "random":
+        rng.shuffle(rows)
+        for index, row in enumerate(rows):
+            row["split"] = split_for_index(index, len(rows))
+    else:
+        raise ValueError(f"unknown split strategy: {split_strategy}")
     rng.shuffle(rows)
     for index, row in enumerate(rows):
         row["id"] = index
-        row["split"] = split_for_index(index, len(rows))
     return rows
+
+
+def family_is_no_reaction(family: object) -> bool:
+    return str(family).startswith("no_reaction")
+
+
+def sample_rows_by_family(
+    pool: list[dict[str, object]],
+    *,
+    num_rows: int,
+    element_synthesis_fraction: float,
+    no_reaction_fraction: float,
+    rng: random.Random,
+) -> list[dict[str, object]]:
+    by_family: dict[str, list[dict[str, object]]] = {}
+    for row in pool:
+        by_family.setdefault(str(row["family"]), []).append(row)
+
+    selected: list[dict[str, object]] = []
+    used_keys: set[int] = set()
+
+    def draw(families: list[str], count: int) -> int:
+        available = [row for family in families for row in by_family.get(family, []) if id(row) not in used_keys]
+        take = min(count, len(available))
+        if take <= 0:
+            return 0
+        sampled = rng.sample(available, take)
+        for row in sampled:
+            used_keys.add(id(row))
+        selected.extend(sampled)
+        return take
+
+    def draw_balanced(families: list[str], count: int) -> int:
+        taken = 0
+        remaining = count
+        active = [family for family in families if any(id(row) not in used_keys for row in by_family.get(family, []))]
+        while remaining > 0 and active:
+            per_family = max(1, math.ceil(remaining / len(active)))
+            progress = 0
+            for family in list(active):
+                if remaining <= 0:
+                    break
+                progress += draw([family], min(per_family, remaining))
+                remaining = count - progress - taken
+            taken += progress
+            active = [family for family in families if any(id(row) not in used_keys for row in by_family.get(family, []))]
+            if progress == 0:
+                break
+        return taken
+
+    no_reaction_families = sorted(family for family in by_family if family_is_no_reaction(family))
+    element_families = ["element_synthesis"] if "element_synthesis" in by_family else []
+
+    no_reaction_target = round(num_rows * no_reaction_fraction)
+    element_target = round(num_rows * element_synthesis_fraction)
+    no_reaction_taken = draw_balanced(no_reaction_families, no_reaction_target)
+    element_target = min(element_target, num_rows - len(selected))
+    element_taken = draw(element_families, element_target)
+
+    priority_positive_families = [
+        "acid_base_neutralization",
+        "single_displacement_metal",
+        "halogen_displacement",
+        "acid_metal",
+        "combustion",
+        "synthesis",
+    ]
+    priority_positive_taken = draw(
+        [family for family in priority_positive_families if family in by_family],
+        num_rows - len(selected),
+    )
+
+    remaining = num_rows - len(selected)
+    positive_other_families = sorted(
+        family
+        for family in by_family
+        if family not in element_families
+        and family not in priority_positive_families
+        and not family_is_no_reaction(family)
+    )
+    if not positive_other_families:
+        raise ValueError("no non-element positive reaction families were generated")
+
+    while remaining > 0:
+        progress = 0
+        active = [
+            family
+            for family in positive_other_families
+            if any(id(row) not in used_keys for row in by_family.get(family, []))
+        ]
+        if not active:
+            fallback = [row for row in pool if id(row) not in used_keys]
+            if len(fallback) < remaining:
+                raise ValueError(f"only {len(selected) + len(fallback)} unique rows available, fewer than requested {num_rows}")
+            for row in rng.sample(fallback, remaining):
+                used_keys.add(id(row))
+                selected.append(row)
+            break
+        per_family = max(1, math.ceil(remaining / len(active)))
+        for family in active:
+            if remaining <= 0:
+                break
+            progress += draw([family], min(per_family, remaining))
+            remaining = num_rows - len(selected)
+        if progress == 0:
+            raise ValueError(f"could not sample enough rows; selected {len(selected)} of {num_rows}")
+
+    rng.shuffle(selected)
+    print(f"Requested no-reaction rows: {no_reaction_target}; sampled {no_reaction_taken}")
+    print(f"Requested element-synthesis rows: {element_target}; sampled {element_taken}")
+    print(f"Prioritized non-double-displacement positive rows: {priority_positive_taken}")
+    return selected
+
+
+def assign_generalization_splits(rows: list[dict[str, object]], *, rng: random.Random) -> None:
+    """Assign whole chemistry groups to splits so group keys do not cross splits."""
+
+    targets = {
+        "train": round(len(rows) * TRAIN_FRACTION),
+        "val": round(len(rows) * VAL_FRACTION),
+    }
+    targets["test"] = len(rows) - targets["train"] - targets["val"]
+    split_counts = {"train": 0, "val": 0, "test": 0}
+
+    grouped: dict[str, list[dict[str, object]]] = {}
+    for row in rows:
+        grouped.setdefault(str(row.get("split_group", row["equation"])), []).append(row)
+    groups = list(grouped.values())
+    rng.shuffle(groups)
+    groups.sort(key=len, reverse=True)
+
+    for group in groups:
+        def score(split: str) -> tuple[float, int]:
+            target = max(targets[split], 1)
+            return (split_counts[split] / target, split_counts[split])
+
+        split = min(("train", "val", "test"), key=score)
+        for row in group:
+            row["split"] = split
+        split_counts[split] += len(group)
 
 
 def split_for_index(index: int, total: int) -> str:
@@ -852,6 +1304,8 @@ def main() -> None:
         max_scale=args.max_scale,
         element_max_scale=args.element_max_scale,
         element_synthesis_fraction=args.element_synthesis_fraction,
+        no_reaction_fraction=args.no_reaction_fraction,
+        split_strategy=args.split_strategy,
         include_reversed_order=args.include_reversed_order,
         allow_stoichiometric_variations=args.allow_stoichiometric_variations,
         seed=args.seed,
@@ -867,11 +1321,14 @@ def main() -> None:
     split_counts = Counter(str(row["split"]) for row in rows)
     family_counts = Counter(str(row["family"]) for row in rows)
     two_output_count = sum(1 for row in rows if row["output_2"] != NULL_TOKEN)
+    no_reaction_count = sum(1 for row in rows if str(row["family"]).startswith("no_reaction"))
     metadata = {
         "name": "reaction_combination_binary_two_output_100k",
         "scientific_scope": (
             "Atom-balanced binary reactions generated from curated element-element synthesis reactions, "
-            "acid-base neutralization templates, and standard aqueous solubility-rule precipitation templates."
+            "single-displacement reactions, halogen-displacement reactions, acid-metal reactions, combustion, "
+            "acid-base neutralization templates, standard aqueous solubility-rule precipitation templates, "
+            "and explicit no-net-reaction controls."
         ),
         "target_design": "two_product_species_tokens",
         "target_note": "Product stoichiometric coefficients are stored as output_1_amount/output_2_amount but are not model targets.",
@@ -889,11 +1346,14 @@ def main() -> None:
         "family_counts": dict(family_counts),
         "two_output_rows": two_output_count,
         "single_output_rows_with_NULL": len(rows) - two_output_count,
+        "no_reaction_rows_with_NULL_NULL": no_reaction_count,
         "seed": args.seed,
         "max_scale": args.max_scale,
         "element_max_scale": args.element_max_scale,
         "element_synthesis_fraction": args.element_synthesis_fraction,
+        "no_reaction_fraction": args.no_reaction_fraction,
         "element_synthesis_rows": family_counts.get("element_synthesis", 0),
+        "split_strategy": args.split_strategy,
         "include_reversed_order": args.include_reversed_order,
         "allow_stoichiometric_variations": args.allow_stoichiometric_variations,
         "unique_reaction_policy": (
@@ -913,6 +1373,7 @@ def main() -> None:
     print(f"Split counts: {dict(split_counts)}")
     print(f"Family counts: {dict(family_counts)}")
     print(f"Element-synthesis rows: {family_counts.get('element_synthesis', 0)}")
+    print(f"No-reaction rows with NULL NULL: {no_reaction_count}")
     print(f"Two-output rows: {two_output_count}")
     print(f"Single-output rows with NULL: {len(rows) - two_output_count}")
     print("Example rows:")
