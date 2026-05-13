@@ -8,11 +8,11 @@ from pathlib import Path
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
-DEFAULT_OUTPUT_ROOT = ROOT_DIR / "outputs" / "reaction_cloud_bundle"
+DEFAULT_OUTPUT_ROOT = ROOT_DIR / "outputs" / "colour_cloud_bundle"
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Launch only the 12 chemistry reaction runs: 4 layer depths x 3 seeds.")
+    parser = argparse.ArgumentParser(description="Launch only the 12 colour runs: 4 layer depths x 3 seeds.")
     parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
     parser.add_argument("--parallel-workers", type=int, default=12)
     parser.add_argument("--max-steps", type=int, default=100000)
@@ -25,12 +25,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--log-every", type=int, default=100)
     parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
     parser.add_argument("--dataset-seed", type=int, default=42)
-    parser.add_argument("--num-rows", type=int, default=100000)
-    parser.add_argument("--max-scale", type=int, default=12)
-    parser.add_argument("--element-max-scale", type=int, default=1)
-    parser.add_argument("--element-synthesis-fraction", type=float, default=0.50)
-    parser.add_argument("--no-reaction-fraction", type=float, default=0.25)
-    parser.add_argument("--split-strategy", choices=["generalization", "random"], default="generalization")
+    parser.add_argument("--num-base-colors", type=int, default=2000)
     parser.add_argument("--poll-interval-sec", type=float, default=5.0)
     return parser.parse_args()
 
@@ -39,7 +34,7 @@ def build_command(args: argparse.Namespace) -> list[str]:
     return [
         sys.executable,
         "-u",
-        str(ROOT_DIR / "reaction-combination" / "run_base_experiment.py"),
+        str(ROOT_DIR / "colour-combination" / "run_base_experiment.py"),
         "--output-root",
         str(args.output_root),
         "--parallel-workers",
@@ -64,18 +59,8 @@ def build_command(args: argparse.Namespace) -> list[str]:
         args.device,
         "--dataset-seed",
         str(args.dataset_seed),
-        "--num-rows",
-        str(args.num_rows),
-        "--max-scale",
-        str(args.max_scale),
-        "--element-max-scale",
-        str(args.element_max_scale),
-        "--element-synthesis-fraction",
-        str(args.element_synthesis_fraction),
-        "--no-reaction-fraction",
-        str(args.no_reaction_fraction),
-        "--split-strategy",
-        args.split_strategy,
+        "--num-base-colors",
+        str(args.num_base_colors),
         "--poll-interval-sec",
         str(args.poll_interval_sec),
     ]

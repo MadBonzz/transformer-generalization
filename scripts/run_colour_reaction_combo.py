@@ -12,7 +12,7 @@ from tqdm.auto import tqdm
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
-DEFAULT_OUTPUT_ROOT = ROOT_DIR / "outputs" / "colour_reaction_12runs"
+DEFAULT_OUTPUT_ROOT = ROOT_DIR / "outputs" / "colour_reaction_24runs"
 REQUIRED_MODULES = {
     "torch": "torch",
     "tqdm": "tqdm",
@@ -24,23 +24,23 @@ REQUIRED_MODULES = {
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Launch the 6 colour runs and 6 chemistry runs into one downloadable output bundle."
+        description="Launch the 12 colour runs and 12 chemistry runs into one downloadable output bundle."
     )
     parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
     parser.add_argument("--parallel-workers", type=int, default=12)
-    parser.add_argument("--max-steps", type=int, default=500000)
+    parser.add_argument("--max-steps", type=int, default=100000)
     parser.add_argument(
         "--checkpoint-schedule",
         type=str,
-        default="staged",
+        default="fixed",
         choices=["staged", "fixed", "none"],
         help="staged saves every 1k through 25k, then every --checkpoint-every-steps.",
     )
-    parser.add_argument("--checkpoint-every-steps", type=int, default=25000)
+    parser.add_argument("--checkpoint-every-steps", type=int, default=10000)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=0.5)
-    parser.add_argument("--eval-every", type=int, default=500)
+    parser.add_argument("--eval-every", type=int, default=100)
     parser.add_argument("--log-every", type=int, default=100)
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"])
     parser.add_argument("--dataset-seed", type=int, default=42)
@@ -58,11 +58,11 @@ def parse_args() -> argparse.Namespace:
 
 def split_workers(total_workers: int) -> tuple[int, int]:
     if total_workers <= 0:
-        return 6, 6
-    colour_workers = min(6, max(1, total_workers // 2))
-    reaction_workers = min(6, max(1, total_workers - colour_workers))
-    if total_workers >= 12:
-        return 6, 6
+        return 12, 12
+    colour_workers = min(12, max(1, total_workers // 2))
+    reaction_workers = min(12, max(1, total_workers - colour_workers))
+    if total_workers >= 24:
+        return 12, 12
     return colour_workers, reaction_workers
 
 
@@ -170,9 +170,9 @@ def write_manifest(args: argparse.Namespace, colour_workers: int, chemistry_work
             "colour": str(args.output_root / "colour"),
             "chemistry": str(args.output_root / "chemistry"),
         },
-        "total_runs": 12,
-        "colour_runs": 6,
-        "chemistry_runs": 6,
+        "total_runs": 24,
+        "colour_runs": 12,
+        "chemistry_runs": 12,
         "requested_parallel_workers": args.parallel_workers,
         "colour_parallel_workers": colour_workers,
         "chemistry_parallel_workers": chemistry_workers,

@@ -51,17 +51,17 @@ class RunConfig:
 def transformer_run_prefix(transformer_n_layers: int) -> str:
     if transformer_n_layers == 1:
         return "transformer"
-    if transformer_n_layers == 2:
-        return "transformer2"
-    raise ValueError("transformer_n_layers must be 1 or 2")
+    if transformer_n_layers >= 2:
+        return f"transformer{transformer_n_layers}"
+    raise ValueError("transformer_n_layers must be positive")
 
 
 def transformer_architecture_name(transformer_n_layers: int) -> str:
     if transformer_n_layers == 1:
         return "neel_nanda_1layer"
-    if transformer_n_layers == 2:
-        return "power_etal_2layer"
-    raise ValueError("transformer_n_layers must be 1 or 2")
+    if transformer_n_layers >= 2:
+        return f"power_etal_{transformer_n_layers}layer"
+    raise ValueError("transformer_n_layers must be positive")
 
 
 def run_config_payload(config: RunConfig) -> dict[str, object]:
@@ -103,13 +103,16 @@ def build_model(config: RunConfig, info: DatasetInfo) -> nn.Module:
                 vocab_size=info.vocab_size,
                 seq_len=info.seq_len,
             )
-        elif config.transformer_n_layers == 2:
+        elif config.transformer_n_layers >= 2:
             transformer_config = TransformerConfig.power_grokking(
                 vocab_size=info.vocab_size,
                 seq_len=info.seq_len,
             )
+            transformer_config = TransformerConfig(
+                **{**asdict(transformer_config), "n_layers": config.transformer_n_layers}
+            )
         else:
-            raise ValueError("transformer_n_layers must be 1 or 2")
+            raise ValueError("transformer_n_layers must be positive")
         return GrokkingTransformer(transformer_config)
     if config.model_type == "mlp":
         if info.seq_len != 3:

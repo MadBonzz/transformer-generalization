@@ -9,7 +9,7 @@ The current baseline experiment uses the Mixbox pigment-like generator in
 `generate_mixbox_dataset.py`. The saved compact dataset has this row format:
 
 ```text
-hex_1,hex_2,t,output_hex
+hex_1,hex_2,ratio_1_parts,ratio_2_parts,t,output_hex
 ```
 
 `t` is the percentage of colour 2 in Mixbox interpolation terms:
@@ -17,6 +17,9 @@ hex_1,hex_2,t,output_hex
 ```text
 t = ratio_2_parts / (ratio_1_parts + ratio_2_parts)
 ```
+
+So `t=0.333333` means colour 2 is one third of the mixture, e.g. a
+`2:1` mix of colour 1 to colour 2. A `1:2` mix gives `t=0.666667`.
 
 The runner generates the dataset on the fly with seed `42` by default. It also
 writes training files used by the model:
@@ -27,13 +30,15 @@ writes training files used by the model:
 
 Token layout:
 
-- Each base-palette hex code is one shared color token.
+- Each token is an integer value in `[0, 255]`.
+- Each colour is represented as three RGB channel tokens.
 - Mixbox produces the raw mixture, then the target is quantized to the nearest base-palette color.
-- Each unique `t` value is a separate input-only token.
-- Input sequence length: `3`, as `[hex_1_token, hex_2_token, t_token]`.
-- Output target: one hex token.
-- Default color vocabulary: `2000` base hex tokens.
-- Default total input vocabulary: `2015` tokens, from `2000` base colors plus `15` `t` tokens.
+- Amounts use separate `AMOUNT_n` tokens, so amount `2` is not confused with RGB value `2`.
+- `PLUS` separates the two colours and `EQUALS` marks the end of the input.
+- Input sequence length: `10`, as `[amount_1, r1, g1, b1, PLUS, amount_2, r2, g2, b2, EQUALS]`.
+- Output target length: `3`, as `[out_r, out_g, out_b]`.
+- Model vocabulary size: `265` for the default ratio pool: `256` RGB values, `7` amount tokens, `PLUS`, and `EQUALS`.
+- Target vocabulary size: `256`.
 - Split: `50%` train, `25%` validation, `25%` test.
 
 ## Baseline Runs
@@ -44,13 +49,14 @@ Run the base experiment:
 python colour-combination/run_base_experiment.py
 ```
 
-This runs six jobs:
+This runs twelve jobs:
 
 - 1-layer Neel/Nanda-style transformer, seeds `0, 1, 2`
-- 2-layer Power-style transformer, seeds `0, 1, 2`
-- `500000` training steps per run
+- 2-, 3-, and 4-layer Power-style transformers, seeds `0, 1, 2`
+- `100000` training steps per run
 - weight decay `0.5`
-- uniform checkpoints every `25000` steps under each run's `checkpoints/` folder
+- full train/val/test metrics every `100` steps
+- fixed checkpoints every `10000` steps under each run's `checkpoints/` folder
 
 Default outputs:
 
@@ -69,7 +75,7 @@ This folder is the complete run bundle. It contains:
 Parallel run example:
 
 ```bash
-python colour-combination/run_base_experiment.py --parallel-workers 2
+python scripts/run_colour_only.py --parallel-workers 12 --device cuda
 ```
 
 Deterministic dataset controls:
@@ -117,10 +123,11 @@ It writes:
 The saved mixture columns are compact:
 
 ```text
-hex_1,hex_2,t,output_hex
+hex_1,hex_2,ratio_1_parts,ratio_2_parts,t,output_hex
 ```
 
 `t` is the percentage of colour 2 in Mixbox interpolation terms, so `t=0.5`
 means a `1:1` mix and `t=0.666667` means `1:2`. RGB values are used only
-internally for Mixbox, nearest-palette quantization, and validation. Mixbox is
-installed from the `pymixbox` package and imported as `mixbox`.
+internally for Mixbox, nearest-palette quantization, validation, and the
+model-facing RGB-token dataset. Mixbox is installed from the `pymixbox` package
+and imported as `mixbox`.

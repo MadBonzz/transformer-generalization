@@ -5,23 +5,28 @@ This folder contains a deterministic binary chemical-reaction dataset generator.
 The model-facing format is:
 
 ```text
-reactant_1 amount_1 reactant_2 amount_2 -> output_1 output_2
+amount_1 expanded_reactant_1 + amount_2 expanded_reactant_2 -> amount_3 expanded_product_1 + amount_4 expanded_product_2
 ```
 
 Examples:
 
 ```text
-HCl 1 NaOH 1 -> NaCl H2O
-H2 1 Cl2 1 -> HCl NULL
-F2 1 Cl2 1 -> NULL NULL
+1 H Cl + 1 Na OH -> 1 Na Cl + 1 H H O
+1 H2 + 1 Cl2 -> 2 H Cl + NULL NULL
+1 F2 + 1 Cl2 -> NULL NULL + NULL NULL
 ```
 
-`NULL` is an explicit species token used when the reaction has only one product
-species, and `NULL NULL` is used for explicit no-net-reaction examples. Product
-stoichiometric coefficients are stored in the CSV as
-`output_1_amount` and `output_2_amount`, but the model target is only the two
-product species tokens. This keeps the input context fixed at 4 tokens and the
-target fixed at 2 tokens.
+Formulas are expanded into repeated element/polyatomic-unit tokens. For example,
+`Ca(ClO4)2` becomes `Ca ClO4 ClO4`, and `2H2SO4` is represented as
+`2 H H SO4`: the leading stoichiometric coefficient is a single amount token,
+while within-formula counts are expanded. Standalone elemental molecules such as
+`Cl2`, `O2`, `N2`, and `P4` remain distinct unit tokens, so `Cl2` is not confused
+with chloride `Cl`. `NULL NULL` is used as one missing product slot;
+no-reaction rows use `NULL NULL + NULL NULL`.
+
+Inputs and targets are padded to fixed lengths with `PAD` for batching. The
+current default 100k dataset filters out hydrocarbons and any formula whose
+expanded representation has 8 or more unit tokens.
 
 The dataset is generated from:
 
@@ -30,7 +35,6 @@ The dataset is generated from:
 - metal single-displacement reactions from a conservative activity series,
 - halogen-displacement reactions,
 - active metal + non-oxidizing acid reactions,
-- simple hydrocarbon combustion reactions,
 - acid-base neutralization templates,
 - aqueous double-displacement reactions filtered by standard solubility rules,
 - explicit no-net-reaction controls, including soluble spectator salt pairs,
@@ -57,8 +61,8 @@ reaction-combination/outputs/reaction_combination_100k/
 Files written:
 
 - `reaction_combination.csv`: human-readable reaction rows.
-- `tokenized_examples.csv`: four-token inputs and two-token targets.
-- `vocab.csv`: species tokens, amount tokens, and the `NULL` token.
+- `tokenized_examples.csv`: padded expanded-token inputs and padded expanded-token targets.
+- `vocab.csv`: unit tokens, amount tokens, `+`, `->`, `NULL`, and `PAD`.
 - `metadata.json`: dataset shape, split counts, and validation metadata.
 
 Default dataset shape:
@@ -67,10 +71,10 @@ Default dataset shape:
 - `50%` train, `25%` validation, `25%` test.
 - the default split strategy holds out whole chemistry groups so a `split_group`
   does not appear in more than one split.
-- `4` input tokens: reactant species, amount, reactant species, amount.
-- `2` output tokens: product species, product species-or-`NULL`.
-- about `2.5k` species tokens including `NULL` in the current default generation.
-- about `10` amount tokens in the current default generation.
+- variable expanded inputs padded to a fixed sequence length.
+- variable expanded product-side targets padded to a fixed target sequence length.
+- about `90` unit tokens in the current default generation.
+- about `8` amount tokens in the current default generation.
 - about `600` unique element-element synthesis rows in the current default generation.
 - `25%` no-reaction rows by default.
 
@@ -96,10 +100,10 @@ python reaction-combination/run_base_experiment.py --parallel-workers 1
 
 Default experiment settings:
 
-- `6` runs: transformer layers `1, 2` crossed with seeds `0, 1, 2`.
-- `500,000` training steps per run.
-- full train/val/test metrics every `500` steps.
-- staged checkpoints every `1,000` steps through `25,000`, then every `25,000` steps.
+- `12` runs: transformer layers `1, 2, 3, 4` crossed with seeds `0, 1, 2`.
+- `100,000` training steps per run.
+- full train/val/test metrics every `100` steps.
+- fixed checkpoints every `10,000` steps.
 - `batch_size=256`, `learning_rate=1e-3`, `weight_decay=0.5`.
 - one output bundle under `reaction-combination/outputs/reaction_base_case/`.
 
@@ -107,5 +111,5 @@ The runner generates the dataset on the fly, validates tokenization and atom
 balance, writes `dataset_generation.log`, `dataset_validation.json`,
 `experiment_manifest.json`, `summary.csv`, and per-run `config.json`,
 `metrics.jsonl`, `metrics.csv`, `progress.json`, `result.json`,
-`dataset_snapshot.pt`, checkpoints, final checkpoint, and val/test prediction
+`dataset_snapshot.pt`, checkpoints, `checkpoint_path` in `result.json`, and val/test prediction
 CSVs.

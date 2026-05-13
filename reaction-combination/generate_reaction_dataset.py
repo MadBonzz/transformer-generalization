@@ -18,11 +18,15 @@ DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parent / "outputs" / "reaction_com
 TRAIN_FRACTION = 0.50
 VAL_FRACTION = 0.25
 NULL_TOKEN = "NULL"
+PAD_TOKEN = "PAD"
+PLUS_TOKEN = "+"
+ARROW_TOKEN = "->"
 DEFAULT_ELEMENT_SYNTHESIS_FRACTION = 0.50
 DEFAULT_ELEMENT_MAX_SCALE = 1
 MAX_DOUBLE_DISPLACEMENT_CANDIDATES = 140_000
 MAX_NO_REACTION_CANDIDATES = 80_000
 DEFAULT_NO_REACTION_FRACTION = 0.25
+MAX_EXPANDED_SPECIES_UNITS = 7
 
 
 @dataclass(frozen=True)
@@ -414,6 +418,108 @@ def parse_formula(formula: str) -> Counter[str]:
     if index != len(formula):
         raise ValueError(f"failed to parse full formula: {formula!r}")
     return parsed
+
+
+def is_standalone_elemental_molecule(formula: str) -> bool:
+    match = re.fullmatch(r"([A-Z][a-z]?)(\d+)", formula)
+    return match is not None and int(match.group(2)) > 1
+
+
+def known_unit_tokens() -> tuple[str, ...]:
+    """Unit tokens used for the expanded ionic/formula representation."""
+
+    units = {ion.formula for ion in (*CATIONS, *ANIONS, *ACID_ANIONS, *BASE_CATIONS)}
+    for unit in tuple(units):
+        units.update(re.findall(r"[A-Z][a-z]?", unit))
+    for reaction in (*SYNTHESIS_REACTIONS, *COMBUSTION_REACTIONS):
+        for formula in (*reaction.products, reaction.reactant_1, reaction.reactant_2):
+            units.update(re.findall(r"[A-Z][a-z]?", formula))
+    return tuple(sorted(units, key=len, reverse=True))
+
+
+KNOWN_UNIT_TOKENS = known_unit_tokens()
+
+
+def parse_number_at(formula: str, index: int) -> tuple[int, int]:
+    start = index
+    while index < len(formula) and formula[index].isdigit():
+        index += 1
+    return (int(formula[start:index]) if index > start else 1, index)
+
+
+def expand_species_units(formula: str) -> list[str]:
+    """Expand a formula into repeated element/polyatomic-unit tokens.
+
+    Examples:
+    - Ca(ClO4)2 -> Ca ClO4 ClO4
+    - H2SO4 -> H H SO4
+    - Al2(SO4)3 -> Al Al SO4 SO4 SO4
+    """
+
+    if formula == NULL_TOKEN:
+        return [NULL_TOKEN]
+    if is_standalone_elemental_molecule(formula):
+        return [formula]
+
+    def parse_group(index: int, stop: str | None = None) -> tuple[list[str], int]:
+        units: list[str] = []
+        while index < len(formula):
+            if stop is not None and formula[index] == stop:
+                return units, index + 1
+            if formula[index] == "(":
+                inner_units, index_after_group = parse_group(index + 1, ")")
+                multiplier, index = parse_number_at(formula, index_after_group)
+                units.extend(inner_units * multiplier)
+                continue
+            if formula[index] == ")":
+                raise ValueError(f"unmatched ')' in formula {formula!r}")
+
+            matched = None
+            for unit in KNOWN_UNIT_TOKENS:
+                if formula.startswith(unit, index):
+                    matched = unit
+                    break
+            if matched is None:
+                match = re.match(r"[A-Z][a-z]?", formula[index:])
+                if match is None:
+                    raise ValueError(f"invalid formula {formula!r} at index {index}")
+                matched = match.group(0)
+
+            index += len(matched)
+            if re.fullmatch(r"[A-Z][a-z]?", matched):
+                multiplier, index = parse_number_at(formula, index)
+            else:
+                multiplier = 1
+            units.extend([matched] * multiplier)
+
+        if stop is not None:
+            raise ValueError(f"missing closing {stop!r} in formula {formula!r}")
+        return units, index
+
+    expanded, index = parse_group(0)
+    if index != len(formula):
+        raise ValueError(f"failed to expand full formula: {formula!r}")
+    return expanded
+
+
+def is_hydrocarbon(formula: str) -> bool:
+    counts = parse_formula(formula)
+    return set(counts) <= {"C", "H"} and "C" in counts and "H" in counts
+
+
+def species_is_allowed(formula: str) -> bool:
+    if formula == NULL_TOKEN:
+        return True
+    return not is_hydrocarbon(formula) and len(expand_species_units(formula)) <= MAX_EXPANDED_SPECIES_UNITS
+
+
+def row_species(row: dict[str, object]) -> tuple[str, str, str, str]:
+    return (
+        str(row["reactant_1"]),
+        str(row["reactant_2"]),
+        str(row["output_1"]),
+        str(row["output_2"]),
+    )
 
 
 def species_counts(formula: str) -> Counter[str]:
@@ -1048,6 +1154,13 @@ def build_rows(
         include_reversed_order=include_reversed_order,
         allow_stoichiometric_variations=allow_stoichiometric_variations,
     )
+    unfiltered_pool_size = len(pool)
+    pool = [row for row in pool if all(species_is_allowed(species) for species in row_species(row))]
+    print(
+        "Filtered candidate pool for expanded-token setup: "
+        f"{unfiltered_pool_size} -> {len(pool)} rows "
+        f"(removed hydrocarbons and species with >{MAX_EXPANDED_SPECIES_UNITS} expanded units)"
+    )
     if len(pool) < num_rows:
         raise ValueError(
             f"only generated {len(pool)} valid rows, fewer than requested {num_rows}; increase --max-scale"
@@ -1224,49 +1337,87 @@ def split_for_index(index: int, total: int) -> str:
     return "test"
 
 
-def build_vocab(rows: list[dict[str, object]]) -> tuple[list[dict[str, object]], dict[str, int], dict[int, int]]:
-    species = sorted(
-        {
-            *(str(row["reactant_1"]) for row in rows),
-            *(str(row["reactant_2"]) for row in rows),
-            *(str(row["output_1"]) for row in rows),
-            *(str(row["output_2"]) for row in rows),
-        }
-    )
-    if NULL_TOKEN not in species:
-        species.append(NULL_TOKEN)
-        species = sorted(species)
-    amounts = sorted({int(row["amount_1"]) for row in rows} | {int(row["amount_2"]) for row in rows})
-    species_to_id = {formula: index for index, formula in enumerate(species)}
-    amount_token_start = len(species)
-    amount_to_id = {amount: amount_token_start + index for index, amount in enumerate(amounts)}
+def product_tokens(amount: int, formula: str) -> list[str]:
+    if formula == NULL_TOKEN:
+        return [NULL_TOKEN, NULL_TOKEN]
+    return [f"AMOUNT_{amount}", *expand_species_units(formula)]
 
+
+def input_tokens_for_row(row: dict[str, object]) -> list[str]:
+    return [
+        f"AMOUNT_{int(row['amount_1'])}",
+        *expand_species_units(str(row["reactant_1"])),
+        PLUS_TOKEN,
+        f"AMOUNT_{int(row['amount_2'])}",
+        *expand_species_units(str(row["reactant_2"])),
+        ARROW_TOKEN,
+    ]
+
+
+def target_tokens_for_row(row: dict[str, object]) -> list[str]:
+    return [
+        *product_tokens(int(row["output_1_amount"]), str(row["output_1"])),
+        PLUS_TOKEN,
+        *product_tokens(int(row["output_2_amount"]), str(row["output_2"])),
+    ]
+
+
+def build_vocab(rows: list[dict[str, object]]) -> tuple[list[dict[str, object]], dict[str, int]]:
+    token_values = {PAD_TOKEN, NULL_TOKEN, PLUS_TOKEN, ARROW_TOKEN}
+    for row in rows:
+        token_values.update(input_tokens_for_row(row))
+        token_values.update(target_tokens_for_row(row))
+
+    def token_sort_key(token: str) -> tuple[int, object]:
+        if token == PAD_TOKEN:
+            return (0, token)
+        if token in {NULL_TOKEN, PLUS_TOKEN, ARROW_TOKEN}:
+            return (1, token)
+        if token.startswith("AMOUNT_"):
+            return (2, int(token.removeprefix("AMOUNT_")))
+        return (3, token)
+
+    token_to_id = {token: index for index, token in enumerate(sorted(token_values, key=token_sort_key))}
     vocab_rows: list[dict[str, object]] = []
-    for formula, token_id in species_to_id.items():
-        kind = "null" if formula == NULL_TOKEN else "species"
-        vocab_rows.append({"token_id": token_id, "token": f"SPECIES_{token_id:04d}", "kind": kind, "value": formula})
-    for amount, token_id in amount_to_id.items():
-        vocab_rows.append({"token_id": token_id, "token": f"AMOUNT_{amount}", "kind": "amount", "value": amount})
-    return vocab_rows, species_to_id, amount_to_id
+    for token, token_id in token_to_id.items():
+        if token == PAD_TOKEN:
+            kind = "pad"
+            value: object = token
+        elif token in {NULL_TOKEN, PLUS_TOKEN, ARROW_TOKEN}:
+            kind = "special"
+            value = token
+        elif token.startswith("AMOUNT_"):
+            kind = "amount"
+            value = int(token.removeprefix("AMOUNT_"))
+        else:
+            kind = "unit"
+            value = token
+        vocab_rows.append({"token_id": token_id, "token": token, "kind": kind, "value": value})
+    return vocab_rows, token_to_id
 
 
 def build_tokenized_rows(
     rows: list[dict[str, object]],
-    species_to_id: dict[str, int],
-    amount_to_id: dict[int, int],
+    token_to_id: dict[str, int],
 ) -> list[dict[str, object]]:
+    input_token_rows = [input_tokens_for_row(row) for row in rows]
+    target_token_rows = [target_tokens_for_row(row) for row in rows]
+    input_seq_len = max(len(tokens) for tokens in input_token_rows)
+    target_seq_len = max(len(tokens) for tokens in target_token_rows)
     tokenized = []
-    for row in rows:
+    for row, input_tokens, target_tokens in zip(rows, input_token_rows, target_token_rows, strict=True):
+        padded_input_tokens = [*input_tokens, *([PAD_TOKEN] * (input_seq_len - len(input_tokens)))]
+        padded_target_tokens = [*target_tokens, *([PAD_TOKEN] * (target_seq_len - len(target_tokens)))]
         tokenized.append(
             {
                 "id": row["id"],
                 "split": row["split"],
-                "input_0_reactant_1_id": species_to_id[str(row["reactant_1"])],
-                "input_1_amount_1_id": amount_to_id[int(row["amount_1"])],
-                "input_2_reactant_2_id": species_to_id[str(row["reactant_2"])],
-                "input_3_amount_2_id": amount_to_id[int(row["amount_2"])],
-                "target_0_output_1_id": species_to_id[str(row["output_1"])],
-                "target_1_output_2_id": species_to_id[str(row["output_2"])],
+                "input_ids": " ".join(str(token_to_id[token]) for token in padded_input_tokens),
+                "target_ids": " ".join(str(token_to_id[token]) for token in padded_target_tokens),
+                "input_tokens": " ".join(input_tokens),
+                "target_tokens": " ".join(target_tokens),
+                "input_length": len(input_tokens),
+                "target_length": len(target_tokens),
                 "reactant_1": row["reactant_1"],
                 "amount_1": row["amount_1"],
                 "reactant_2": row["reactant_2"],
@@ -1310,8 +1461,8 @@ def main() -> None:
         allow_stoichiometric_variations=args.allow_stoichiometric_variations,
         seed=args.seed,
     )
-    vocab_rows, species_to_id, amount_to_id = build_vocab(rows)
-    tokenized_rows = build_tokenized_rows(rows, species_to_id, amount_to_id)
+    vocab_rows, token_to_id = build_vocab(rows)
+    tokenized_rows = build_tokenized_rows(rows, token_to_id)
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     write_csv(args.output_dir / "reaction_combination.csv", rows)
@@ -1322,25 +1473,45 @@ def main() -> None:
     family_counts = Counter(str(row["family"]) for row in rows)
     two_output_count = sum(1 for row in rows if row["output_2"] != NULL_TOKEN)
     no_reaction_count = sum(1 for row in rows if str(row["family"]).startswith("no_reaction"))
+    input_seq_len = max(int(row["input_length"]) for row in tokenized_rows)
+    target_seq_len = max(int(row["target_length"]) for row in tokenized_rows)
+    unit_tokens = [row for row in vocab_rows if row["kind"] == "unit"]
+    amount_tokens = [row for row in vocab_rows if row["kind"] == "amount"]
+    max_species_expanded_units = max(
+        len(expand_species_units(species))
+        for row in rows
+        for species in row_species(row)
+        if species != NULL_TOKEN
+    )
     metadata = {
-        "name": "reaction_combination_binary_two_output_100k",
+        "name": "reaction_combination_expanded_units_100k",
         "scientific_scope": (
             "Atom-balanced binary reactions generated from curated element-element synthesis reactions, "
             "single-displacement reactions, halogen-displacement reactions, acid-metal reactions, combustion, "
             "acid-base neutralization templates, standard aqueous solubility-rule precipitation templates, "
             "and explicit no-net-reaction controls."
         ),
-        "target_design": "two_product_species_tokens",
-        "target_note": "Product stoichiometric coefficients are stored as output_1_amount/output_2_amount but are not model targets.",
+        "target_design": "expanded_product_side_token_sequence",
+        "target_note": "The model target is the expanded product side: amount/product-units + amount/product-units, padded with PAD.",
         "null_token": NULL_TOKEN,
-        "sequence_length": 4,
-        "input_format": ["reactant_1_species_token", "amount_1_token", "reactant_2_species_token", "amount_2_token"],
-        "target_format": ["output_1_species_token", "output_2_species_or_NULL_token"],
+        "pad_token": PAD_TOKEN,
+        "plus_token": PLUS_TOKEN,
+        "arrow_token": ARROW_TOKEN,
+        "pad_token_id": token_to_id[PAD_TOKEN],
+        "sequence_length": input_seq_len,
+        "target_sequence_length": target_seq_len,
+        "input_format": ["amount_1", "expanded_reactant_1_units", "+", "amount_2", "expanded_reactant_2_units", "->", "PAD..."],
+        "target_format": ["amount_or_NULL", "expanded_product_1_units_or_NULL", "+", "amount_or_NULL", "expanded_product_2_units_or_NULL", "PAD..."],
         "num_examples": len(rows),
-        "num_species_tokens_including_null": len(species_to_id),
-        "num_amount_tokens": len(amount_to_id),
+        "num_unit_tokens": len(unit_tokens),
+        "num_amount_tokens": len(amount_tokens),
+        "num_special_tokens": len(vocab_rows) - len(unit_tokens) - len(amount_tokens),
+        "num_species_tokens_including_null": len({species for row in rows for species in row_species(row)} | {NULL_TOKEN}),
         "vocab_size": len(vocab_rows),
-        "target_vocab_size": len(species_to_id),
+        "target_vocab_size": len(vocab_rows),
+        "max_expanded_species_units": max_species_expanded_units,
+        "max_allowed_expanded_species_units": MAX_EXPANDED_SPECIES_UNITS,
+        "filtered_species_policy": "Hydrocarbons and formulas expanding to 8 or more unit tokens are excluded before sampling.",
         "split_fractions": {"train": TRAIN_FRACTION, "val": VAL_FRACTION, "test": 1.0 - TRAIN_FRACTION - VAL_FRACTION},
         "split_counts": dict(split_counts),
         "family_counts": dict(family_counts),
@@ -1367,9 +1538,12 @@ def main() -> None:
         file.write("\n")
 
     print(f"Wrote {len(rows)} reaction examples to {args.output_dir / 'reaction_combination.csv'}")
-    print(f"Species tokens including NULL: {len(species_to_id)}")
-    print(f"Amount tokens: {len(amount_to_id)}")
+    print(f"Expanded unit tokens: {len(unit_tokens)}")
+    print(f"Amount tokens: {len(amount_tokens)}")
     print(f"Vocab size: {len(vocab_rows)}")
+    print(f"Input sequence length: {input_seq_len}")
+    print(f"Target sequence length: {target_seq_len}")
+    print(f"Max expanded species units: {max_species_expanded_units}")
     print(f"Split counts: {dict(split_counts)}")
     print(f"Family counts: {dict(family_counts)}")
     print(f"Element-synthesis rows: {family_counts.get('element_synthesis', 0)}")
@@ -1380,8 +1554,7 @@ def main() -> None:
     for row in rows[:10]:
         print(
             "  "
-            f"{row['reactant_1']} {row['amount_1']} {row['reactant_2']} {row['amount_2']} "
-            f"-> {row['output_1']} {row['output_2']} | {row['equation']}"
+            f"{tokenized_rows[row['id']]['input_tokens']} {tokenized_rows[row['id']]['target_tokens']} | {row['equation']}"
         )
 
 

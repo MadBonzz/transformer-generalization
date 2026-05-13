@@ -337,6 +337,8 @@ def generate_rows(
                 {
                     "hex_1": hex1,
                     "hex_2": hex2,
+                    "ratio_1_parts": ratio1_parts,
+                    "ratio_2_parts": ratio2_parts,
                     "t": round(t, 6),
                     "output_hex": output_hex,
                     "_ratio": f"{ratio1_parts}:{ratio2_parts}",
@@ -354,7 +356,7 @@ def generate_rows(
     rng.shuffle(internal_rows)
     internal_rows = internal_rows[:num_rows]
     internal_df = pd.DataFrame(internal_rows)
-    compact_df = internal_df[["hex_1", "hex_2", "t", "output_hex"]].copy()
+    compact_df = internal_df[["hex_1", "hex_2", "ratio_1_parts", "ratio_2_parts", "t", "output_hex"]].copy()
     ratio_distribution = internal_df["_ratio_category"].value_counts(normalize=True).sort_index() * 100.0
     unique_pairs_used = int(internal_df[["hex_1", "hex_2"]].drop_duplicates().shape[0])
 
@@ -413,48 +415,84 @@ def add_deterministic_splits(compact_df: pd.DataFrame, *, seed: int) -> pd.DataF
 
 def write_training_files(output_dir: Path, compact_df: pd.DataFrame, base_hexes: list[str], *, seed: int) -> None:
     split_df = add_deterministic_splits(compact_df, seed=seed)
-    hex_values = list(base_hexes)
-    hex_to_id = {hex_code: token_id for token_id, hex_code in enumerate(hex_values)}
-    t_values = sorted(float(value) for value in split_df["t"].unique())
-    t_token_start = len(hex_values)
-    t_to_id = {value: t_token_start + index for index, value in enumerate(t_values)}
+    channel_to_id = {value: value for value in range(256)}
+    amount_values = sorted(
+        set(int(value) for value in split_df["ratio_1_parts"].unique())
+        | set(int(value) for value in split_df["ratio_2_parts"].unique())
+    )
+    amount_token_start = 256
+    amount_to_id = {amount: amount_token_start + index for index, amount in enumerate(amount_values)}
+    plus_token_id = amount_token_start + len(amount_values)
+    equals_token_id = plus_token_id + 1
 
     tokenized_rows = []
     for row in split_df.itertuples(index=False):
+        rgb_1 = hex_to_rgb(row.hex_1)
+        rgb_2 = hex_to_rgb(row.hex_2)
+        output_rgb = hex_to_rgb(row.output_hex)
+        amount_1_id = amount_to_id[int(row.ratio_1_parts)]
+        amount_2_id = amount_to_id[int(row.ratio_2_parts)]
+        input_ids = (
+            amount_1_id,
+            *rgb_1,
+            plus_token_id,
+            amount_2_id,
+            *rgb_2,
+            equals_token_id,
+        )
         tokenized_rows.append(
             {
                 "id": int(row.id),
                 "split": row.split,
-                "input_0_hex_1_id": hex_to_id[row.hex_1],
-                "input_1_hex_2_id": hex_to_id[row.hex_2],
-                "input_2_t_id": t_to_id[float(row.t)],
-                "target_hex_id": hex_to_id[row.output_hex],
+                "input_ids": " ".join(str(token) for token in input_ids),
+                "target_ids": " ".join(str(token) for token in output_rgb),
+                "input_0_amount_1_id": amount_1_id,
+                "input_1_rgb_1_r_id": rgb_1[0],
+                "input_2_rgb_1_g_id": rgb_1[1],
+                "input_3_rgb_1_b_id": rgb_1[2],
+                "input_4_plus_id": plus_token_id,
+                "input_5_amount_2_id": amount_2_id,
+                "input_6_rgb_2_r_id": rgb_2[0],
+                "input_7_rgb_2_g_id": rgb_2[1],
+                "input_8_rgb_2_b_id": rgb_2[2],
+                "input_9_equals_id": equals_token_id,
+                "target_0_output_r_id": output_rgb[0],
+                "target_1_output_g_id": output_rgb[1],
+                "target_2_output_b_id": output_rgb[2],
                 "hex_1": row.hex_1,
                 "hex_2": row.hex_2,
+                "ratio_1_parts": int(row.ratio_1_parts),
+                "ratio_2_parts": int(row.ratio_2_parts),
                 "t": float(row.t),
                 "output_hex": row.output_hex,
             }
         )
 
     vocab_rows = []
-    for hex_code, token_id in hex_to_id.items():
+    for value, token_id in channel_to_id.items():
         vocab_rows.append(
             {
                 "token_id": token_id,
-                "token": f"HEX_{token_id:04d}",
-                "kind": "hex",
-                "value": hex_code,
+                "token": f"VALUE_{value:03d}",
+                "kind": "value",
+                "value": value,
             }
         )
-    for value, token_id in t_to_id.items():
+    for amount, token_id in amount_to_id.items():
         vocab_rows.append(
             {
                 "token_id": token_id,
-                "token": f"T_{value:.6f}",
-                "kind": "t",
-                "value": f"{value:.6f}",
+                "token": f"AMOUNT_{amount}",
+                "kind": "amount",
+                "value": amount,
             }
         )
+    vocab_rows.extend(
+        [
+            {"token_id": plus_token_id, "token": "PLUS", "kind": "special", "value": "+"},
+            {"token_id": equals_token_id, "token": "EQUALS", "kind": "special", "value": "="},
+        ]
+    )
 
     split_counts = split_df["split"].value_counts().to_dict()
     metadata = {
@@ -464,25 +502,31 @@ def write_training_files(output_dir: Path, compact_df: pd.DataFrame, base_hexes:
         "mixing_rule": "Mixbox pigment-like interpolation followed by nearest-neighbour quantization to the fixed base palette",
         "raw_mixing_rule": "raw_rgb = mixbox.lerp(rgb_1, rgb_2, t)",
         "target_rule": "output_hex = nearest base-palette hex to raw_rgb by Euclidean RGB distance",
-        "sequence_length": 3,
-        "input_format": ["hex_1_token", "hex_2_token", "t_token"],
-        "target_format": "output_hex_token",
+        "sequence_length": 10,
+        "target_sequence_length": 3,
+        "input_format": ["amount_1_token", "rgb_1_r", "rgb_1_g", "rgb_1_b", "PLUS", "amount_2_token", "rgb_2_r", "rgb_2_g", "rgb_2_b", "EQUALS"],
+        "target_format": ["output_r", "output_g", "output_b"],
         "num_rows": len(split_df),
         "num_base_colours": len(base_hexes),
-        "num_hex_tokens": len(hex_values),
-        "num_t_tokens": len(t_values),
+        "num_hex_tokens": 0,
+        "num_t_tokens": 0,
+        "num_value_tokens": 256,
+        "num_amount_tokens": len(amount_values),
+        "amount_values": amount_values,
+        "plus_token_id": plus_token_id,
+        "equals_token_id": equals_token_id,
         "vocab_size": len(vocab_rows),
-        "target_vocab_size": len(hex_values),
-        "t_token_ids": [t_token_start, t_token_start + len(t_values) - 1],
-        "hex_token_ids": [0, len(hex_values) - 1],
+        "target_vocab_size": 256,
+        "value_token_ids": [0, 255],
         "split_fractions": {"train": TRAIN_FRACTION, "val": VAL_FRACTION, "test": 1.0 - TRAIN_FRACTION - VAL_FRACTION},
         "split_counts": {str(key): int(value) for key, value in split_counts.items()},
         "seed": seed,
         "notes": [
-            "Each base-palette hex code is one token.",
-            "Inputs and outputs are constrained to the same base-palette hex-token vocabulary.",
-            "t tokens are input-only tokens and are not valid output classes.",
-            "The compact CSV stores only hex_1, hex_2, t, output_hex.",
+            "RGB channel/output tokens are integer values in [0, 255].",
+            "Amount tokens are separate from RGB value tokens to disambiguate coefficients from colour channels.",
+            "Input is 10 tokens: amount_1, RGB colour 1, PLUS, amount_2, RGB colour 2, EQUALS.",
+            "Target is 3 tokens: output RGB.",
+            "The compact CSV stores hex_1, hex_2, ratio_1_parts, ratio_2_parts, t, output_hex.",
         ],
     }
 
@@ -525,8 +569,14 @@ def main() -> None:
         print(f"  {category}: {ratio_distribution.get(category, 0.0):.2f}")
     print(f"Unique input pairs used: {unique_pairs_used}")
     print(f"Unique output_hex values: {compact_df['output_hex'].nunique()}")
-    print(f"Hex-token vocabulary size: {len(base_hexes)}")
-    print(f"Total input vocabulary size: {len(base_hexes) + compact_df['t'].nunique()}")
+    amount_values = sorted(
+        set(int(value) for value in compact_df["ratio_1_parts"].unique())
+        | set(int(value) for value in compact_df["ratio_2_parts"].unique())
+    )
+    print(f"Model vocabulary size: {256 + len(amount_values) + 2} tokens (256 RGB values + {len(amount_values)} amount tokens + PLUS/EQUALS)")
+    print("Model input sequence length: 10")
+    print("Model target sequence length: 3")
+    print(f"Amount token values: {amount_values}")
     print(f"Train/val/test rows: {int(NUM_ROWS * TRAIN_FRACTION)}/{int(NUM_ROWS * VAL_FRACTION)}/{NUM_ROWS - int(NUM_ROWS * TRAIN_FRACTION) - int(NUM_ROWS * VAL_FRACTION)}")
     print("Example rows:")
     print(compact_df.head(10).to_string(index=False))

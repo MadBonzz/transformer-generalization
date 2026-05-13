@@ -50,6 +50,7 @@ outputs/**/*.png
 
 # Output archives are intentionally kept out of new commits by default.
 analysis_extracted/
+analysis_extracted*/
 *.tar
 *.tar.gz
 *.tgz

@@ -32,7 +32,15 @@ from grokking_transformer.logging_utils import append_csv, append_csv_stable, ap
 from grokking_transformer.model import TransformerBlock, TransformerConfig  # noqa: E402
 
 sys.path.insert(0, str(THIS_DIR))
-from generate_reaction_dataset import NULL_TOKEN, parse_formula  # noqa: E402
+from generate_reaction_dataset import (  # noqa: E402
+    ARROW_TOKEN,
+    NULL_TOKEN,
+    PAD_TOKEN,
+    PLUS_TOKEN,
+    expand_species_units,
+    parse_formula,
+    species_is_allowed,
+)
 
 
 DEFAULT_OUTPUT_DIR = THIS_DIR / "outputs" / "reaction_base_case"
@@ -68,13 +76,14 @@ class ReactionDataset(Dataset[tuple[torch.Tensor, torch.Tensor]]):
         return self.inputs[idx], self.targets[idx]
 
 
-class TwoOutputGrokkingTransformer(nn.Module):
-    """Same transformer presets as src/model.py, with a two-token product head."""
+class SequenceOutputGrokkingTransformer(nn.Module):
+    """Same transformer presets as src/model.py, with a fixed-length sequence head."""
 
-    def __init__(self, config: TransformerConfig, target_vocab_size: int) -> None:
+    def __init__(self, config: TransformerConfig, target_vocab_size: int, target_seq_len: int) -> None:
         super().__init__()
         self.config = config
         self.target_vocab_size = target_vocab_size
+        self.target_seq_len = target_seq_len
         self.token_embed = nn.Embedding(config.vocab_size, config.d_model)
         if config.positional_embedding_type == "learned":
             self.pos_embed = nn.Parameter(torch.zeros(config.seq_len, config.d_model))
@@ -82,7 +91,7 @@ class TwoOutputGrokkingTransformer(nn.Module):
             self.register_buffer("pos_embed", self._sinusoidal_position_encoding(config.seq_len, config.d_model), persistent=False)
         self.blocks = nn.ModuleList(TransformerBlock(config) for _ in range(config.n_layers))
         self.final_ln = nn.LayerNorm(config.d_model) if config.final_norm else nn.Identity()
-        self.output_head = nn.Linear(config.d_model, 2 * target_vocab_size, bias=False)
+        self.output_head = nn.Linear(config.d_model, target_seq_len * target_vocab_size, bias=False)
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
@@ -110,28 +119,28 @@ class TwoOutputGrokkingTransformer(nn.Module):
             x = block(x)
         x = self.final_ln(x)
         logits = self.output_head(x[:, -1, :])
-        return logits.view(tokens.size(0), 2, self.target_vocab_size)
+        return logits.view(tokens.size(0), self.target_seq_len, self.target_vocab_size)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run the 6-run reaction-combination baseline: 2 transformer depths x 3 seeds."
+        description="Run the 12-run reaction-combination baseline: 4 transformer depths x 3 seeds."
     )
     parser.add_argument("--dataset-dir", type=Path, default=None)
     parser.add_argument("--output-root", "--output-dir", dest="output_root", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--seeds", type=int, nargs="+", default=[0, 1, 2])
-    parser.add_argument("--layers", type=int, nargs="+", default=[1, 2], choices=[1, 2])
-    parser.add_argument("--max-steps", type=int, default=500000)
-    parser.add_argument("--eval-every", type=int, default=500)
+    parser.add_argument("--layers", type=int, nargs="+", default=[1, 2, 3, 4], choices=[1, 2, 3, 4])
+    parser.add_argument("--max-steps", type=int, default=100000)
+    parser.add_argument("--eval-every", type=int, default=100)
     parser.add_argument("--log-every", type=int, default=100)
     parser.add_argument(
         "--checkpoint-schedule",
         type=str,
-        default="staged",
+        default="fixed",
         choices=["staged", "fixed", "none"],
         help="staged: every 1k through 25k, then every --checkpoint-every-steps; fixed: use only --checkpoint-every-steps.",
     )
-    parser.add_argument("--checkpoint-every-steps", type=int, default=25000)
+    parser.add_argument("--checkpoint-every-steps", type=int, default=10000)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=0.5)
@@ -147,7 +156,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--poll-interval-sec", type=float, default=2.0)
     parser.add_argument("--launch-settle-sec", type=float, default=1.0)
     parser.add_argument("--run-single", action="store_true", help=argparse.SUPPRESS)
-    parser.add_argument("--single-layer", type=int, choices=[1, 2], default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--single-layer", type=int, choices=[1, 2, 3, 4], default=None, help=argparse.SUPPRESS)
     parser.add_argument("--single-seed", type=int, default=None, help=argparse.SUPPRESS)
     return parser.parse_args()
 
@@ -243,16 +252,19 @@ def load_metadata(dataset_dir: Path) -> dict[str, object]:
 
 
 def load_vocab(dataset_dir: Path) -> tuple[dict[str, int], dict[int, int]]:
-    species_to_id: dict[str, int] = {}
+    token_to_id: dict[str, int] = {}
     amount_to_id: dict[int, int] = {}
     with (dataset_dir / "vocab.csv").open(newline="", encoding="utf-8") as file:
         for row in csv.DictReader(file):
             token_id = int(row["token_id"])
-            if row["kind"] in {"species", "null"}:
-                species_to_id[row["value"]] = token_id
+            token_to_id[row["token"]] = token_id
+            if row["kind"] in {"unit", "special", "pad"}:
+                token_to_id[row["value"]] = token_id
             elif row["kind"] == "amount":
-                amount_to_id[int(row["value"])] = token_id
-    return species_to_id, amount_to_id
+                amount = int(row["value"])
+                amount_to_id[amount] = token_id
+                token_to_id[f"AMOUNT_{amount}"] = token_id
+    return token_to_id, amount_to_id
 
 
 def load_split_dataset(dataset_dir: Path, split: str) -> ReactionDataset:
@@ -262,15 +274,8 @@ def load_split_dataset(dataset_dir: Path, split: str) -> ReactionDataset:
         for row in csv.DictReader(file):
             if row["split"] != split:
                 continue
-            inputs.append(
-                [
-                    int(row["input_0_reactant_1_id"]),
-                    int(row["input_1_amount_1_id"]),
-                    int(row["input_2_reactant_2_id"]),
-                    int(row["input_3_amount_2_id"]),
-                ]
-            )
-            targets.append([int(row["target_0_output_1_id"]), int(row["target_1_output_2_id"])])
+            inputs.append([int(token_id) for token_id in row["input_ids"].split()])
+            targets.append([int(token_id) for token_id in row["target_ids"].split()])
     if not inputs:
         raise ValueError(f"dataset split {split!r} is empty in {dataset_dir}")
     return ReactionDataset(torch.tensor(inputs, dtype=torch.long), torch.tensor(targets, dtype=torch.long))
@@ -308,8 +313,11 @@ def atom_counts(formulas: list[str], coeffs: list[int]) -> dict[str, int]:
 
 
 def validate_dataset(dataset_dir: Path) -> dict[str, object]:
-    species_to_id, amount_to_id = load_vocab(dataset_dir)
+    token_to_id, amount_to_id = load_vocab(dataset_dir)
     metadata = load_metadata(dataset_dir)
+    pad_token_id = int(metadata["pad_token_id"])
+    sequence_length = int(metadata["sequence_length"])
+    target_sequence_length = int(metadata["target_sequence_length"])
     split_counts: dict[str, int] = {}
     null_rows = 0
     two_output_rows = 0
@@ -318,6 +326,7 @@ def validate_dataset(dataset_dir: Path) -> dict[str, object]:
     element_reactant_species: set[str] = set()
     row_count = 0
     used_species: set[str] = set()
+    used_units: set[str] = set()
     used_amounts: set[int] = set()
 
     with (dataset_dir / "reaction_combination.csv").open(newline="", encoding="utf-8") as file:
@@ -331,15 +340,20 @@ def validate_dataset(dataset_dir: Path) -> dict[str, object]:
                 element_reactant_species.add(row["reactant_1"])
                 element_reactant_species.add(row["reactant_2"])
             species_values = [row["reactant_1"], row["reactant_2"], row["output_1"], row["output_2"]]
-            amount_values = [int(row["amount_1"]), int(row["amount_2"])]
+            amount_values = [int(row["amount_1"]), int(row["amount_2"]), int(row["output_1_amount"]), int(row["output_2_amount"])]
             for species in species_values:
-                if species not in species_to_id:
-                    raise ValueError(f"missing species token for {species!r}")
+                if not species_is_allowed(species):
+                    raise ValueError(f"filtered species should not appear in dataset: {species!r}")
                 used_species.add(species)
+                for unit in expand_species_units(species):
+                    if unit not in token_to_id:
+                        raise ValueError(f"missing expanded unit token for {unit!r} from {species!r}")
+                    used_units.add(unit)
             for amount in amount_values:
-                if amount not in amount_to_id:
+                if amount > 0 and amount not in amount_to_id:
                     raise ValueError(f"missing amount token for {amount}")
-                used_amounts.add(amount)
+                if amount > 0:
+                    used_amounts.add(amount)
 
             if row["output_2"] == NULL_TOKEN:
                 null_rows += 1
@@ -360,16 +374,37 @@ def validate_dataset(dataset_dir: Path) -> dict[str, object]:
     expected_rows = int(metadata["num_examples"])
     if row_count != expected_rows:
         raise ValueError(f"metadata num_examples={expected_rows}, actual rows={row_count}")
-    if NULL_TOKEN not in species_to_id:
+    for token in (PAD_TOKEN, NULL_TOKEN, PLUS_TOKEN, ARROW_TOKEN):
+        if token not in token_to_id:
+            raise ValueError(f"{token} token is missing from vocab")
+    with (dataset_dir / "tokenized_examples.csv").open(newline="", encoding="utf-8") as file:
+        for row in csv.DictReader(file):
+            input_ids = [int(token_id) for token_id in row["input_ids"].split()]
+            target_ids = [int(token_id) for token_id in row["target_ids"].split()]
+            if len(input_ids) != sequence_length:
+                raise ValueError(f"bad input length for row {row['id']}: {len(input_ids)}")
+            if len(target_ids) != target_sequence_length:
+                raise ValueError(f"bad target length for row {row['id']}: {len(target_ids)}")
+            if int(row["input_length"]) > sequence_length or int(row["target_length"]) > target_sequence_length:
+                raise ValueError(f"unpadded length exceeds metadata sequence length: {row}")
+            if any(token_id < 0 or token_id >= int(metadata["vocab_size"]) for token_id in (*input_ids, *target_ids)):
+                raise ValueError(f"token id out of range in tokenized row {row['id']}")
+            if pad_token_id in input_ids[: int(row["input_length"])]:
+                raise ValueError(f"PAD appears inside unpadded input for row {row['id']}")
+            if pad_token_id in target_ids[: int(row["target_length"])]:
+                raise ValueError(f"PAD appears inside unpadded target for row {row['id']}")
+
+    if NULL_TOKEN not in token_to_id:
         raise ValueError("NULL token is missing from vocab")
 
     validation = {
         "validated_at_utc": timestamp_utc(),
         "row_count": row_count,
         "split_counts": split_counts,
-        "species_token_count": len(species_to_id),
+        "token_count": len(token_to_id),
         "amount_token_count": len(amount_to_id),
         "used_species_count": len(used_species),
+        "used_unit_token_count": len(used_units),
         "used_amount_count": len(used_amounts),
         "two_output_rows": two_output_rows,
         "single_output_rows_with_NULL": null_rows,
@@ -377,8 +412,14 @@ def validate_dataset(dataset_dir: Path) -> dict[str, object]:
         "no_reaction_rows_with_NULL_NULL": sum(count for family, count in family_counts.items() if family.startswith("no_reaction")),
         "element_synthesis_rows": element_synthesis_rows,
         "unique_element_reactant_tokens_in_element_synthesis": len(element_reactant_species),
-        "null_token_id": species_to_id[NULL_TOKEN],
-        "tokenization": "Each full element/molecule formula is one species token ID; formulas are not split into atom/subformula tokens.",
+        "pad_token_id": pad_token_id,
+        "null_token_id": token_to_id[NULL_TOKEN],
+        "input_sequence_length": sequence_length,
+        "target_sequence_length": target_sequence_length,
+        "tokenization": (
+            "Formulas are expanded into repeated element/polyatomic-unit tokens. "
+            "Reactant side is amount units + amount units ->; product side is amount units + amount units, padded with PAD."
+        ),
         "chemistry_grounding": (
             "Positive CSV rows are generated from curated reaction templates and atom-balance validated. "
             "No-reaction CSV rows are generated from conservative no-net-reaction templates and target NULL NULL."
@@ -394,53 +435,58 @@ def set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-def build_model(*, layers: int, vocab_size: int, target_vocab_size: int, seq_len: int) -> nn.Module:
+def build_model(*, layers: int, vocab_size: int, target_vocab_size: int, seq_len: int, target_seq_len: int) -> nn.Module:
     if layers == 1:
         config = TransformerConfig.neel_nanda(vocab_size=vocab_size, seq_len=seq_len)
-    elif layers == 2:
-        config = TransformerConfig.power_grokking(vocab_size=vocab_size, seq_len=seq_len)
+    elif layers >= 2:
+        base_config = TransformerConfig.power_grokking(vocab_size=vocab_size, seq_len=seq_len)
+        config = TransformerConfig(**{**asdict(base_config), "n_layers": layers})
     else:
-        raise ValueError("layers must be 1 or 2")
-    return TwoOutputGrokkingTransformer(config, target_vocab_size)
+        raise ValueError("layers must be positive")
+    return SequenceOutputGrokkingTransformer(config, target_vocab_size, target_seq_len)
 
 
 def make_loader(dataset: ReactionDataset, batch_size: int, shuffle: bool) -> DataLoader:
     return DataLoader(dataset, batch_size=min(batch_size, len(dataset)), shuffle=shuffle, drop_last=False)
 
 
-def compute_loss(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-    return F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
+def compute_loss(logits: torch.Tensor, targets: torch.Tensor, *, pad_token_id: int) -> torch.Tensor:
+    return F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1), ignore_index=pad_token_id)
 
 
-def evaluate(model: nn.Module, dataset: ReactionDataset, *, device: torch.device, batch_size: int) -> dict[str, float]:
+def evaluate(model: nn.Module, dataset: ReactionDataset, *, device: torch.device, batch_size: int, pad_token_id: int) -> dict[str, float]:
     loader = make_loader(dataset, batch_size, shuffle=False)
     model.eval()
     total_loss = 0.0
     total_rows = 0
     token_correct = 0
     exact_correct = 0
-    output_1_correct = 0
-    output_2_correct = 0
+    target_0_correct = 0
+    target_1_correct = 0
+    nonpad_tokens = 0
     with torch.no_grad():
         for inputs, targets in loader:
             inputs = inputs.to(device)
             targets = targets.to(device)
             logits = model(inputs)
-            loss = compute_loss(logits, targets)
+            loss = compute_loss(logits, targets, pad_token_id=pad_token_id)
             predictions = logits.argmax(dim=-1)
+            nonpad_mask = targets != pad_token_id
             rows = inputs.size(0)
             total_loss += loss.item() * rows
             total_rows += rows
-            token_correct += (predictions == targets).sum().item()
-            exact_correct += (predictions == targets).all(dim=-1).sum().item()
-            output_1_correct += (predictions[:, 0] == targets[:, 0]).sum().item()
-            output_2_correct += (predictions[:, 1] == targets[:, 1]).sum().item()
+            token_correct += ((predictions == targets) & nonpad_mask).sum().item()
+            nonpad_tokens += nonpad_mask.sum().item()
+            exact_correct += (((predictions == targets) | ~nonpad_mask).all(dim=-1)).sum().item()
+            target_0_correct += (predictions[:, 0] == targets[:, 0]).sum().item()
+            target_1_correct += (predictions[:, 1] == targets[:, 1]).sum().item()
     return {
         "loss": total_loss / max(total_rows, 1),
-        "token_accuracy": token_correct / max(2 * total_rows, 1),
+        "token_accuracy": token_correct / max(nonpad_tokens, 1),
         "exact_match_accuracy": exact_correct / max(total_rows, 1),
-        "output_1_accuracy": output_1_correct / max(total_rows, 1),
-        "output_2_accuracy": output_2_correct / max(total_rows, 1),
+        "target_0_accuracy": target_0_correct / max(total_rows, 1),
+        "target_1_accuracy": target_1_correct / max(total_rows, 1),
+        "nonpad_target_tokens": float(nonpad_tokens),
     }
 
 
@@ -529,7 +575,7 @@ def export_dataset_snapshot(path: Path, train: ReactionDataset, eval_datasets: d
     torch.save(payload, path)
 
 
-def export_prediction_table(path: Path, model: nn.Module, dataset: ReactionDataset, *, device: torch.device, batch_size: int) -> None:
+def export_prediction_table(path: Path, model: nn.Module, dataset: ReactionDataset, *, device: torch.device, batch_size: int, pad_token_id: int) -> None:
     rows: list[dict[str, object]] = []
     loader = make_loader(dataset, batch_size, shuffle=False)
     model.eval()
@@ -542,21 +588,33 @@ def export_prediction_table(path: Path, model: nn.Module, dataset: ReactionDatas
             batch_size_now = inputs.size(0)
             for i in range(batch_size_now):
                 row_index = offset + i
-                target_pair = dataset.targets[row_index].tolist()
-                prediction_pair = predictions[i].cpu().tolist()
+                target_sequence = dataset.targets[row_index].tolist()
+                prediction_sequence = predictions[i].cpu().tolist()
+                nonpad_mask = [target != pad_token_id for target in target_sequence]
+                is_exact = all(
+                    prediction == target or not keep
+                    for prediction, target, keep in zip(prediction_sequence, target_sequence, nonpad_mask, strict=True)
+                )
                 rows.append(
                     {
                         "index": row_index,
                         "input_tokens": " ".join(str(int(x)) for x in dataset.inputs[row_index].tolist()),
-                        "target_0": int(target_pair[0]),
-                        "target_1": int(target_pair[1]),
-                        "prediction_0": int(prediction_pair[0]),
-                        "prediction_1": int(prediction_pair[1]),
-                        "is_exact_match": int(prediction_pair == target_pair),
-                        "is_output_0_correct": int(prediction_pair[0] == target_pair[0]),
-                        "is_output_1_correct": int(prediction_pair[1] == target_pair[1]),
-                        "confidence_0": float(confidences[i, 0].item()),
-                        "confidence_1": float(confidences[i, 1].item()),
+                        "target_ids": " ".join(str(int(x)) for x in target_sequence),
+                        "prediction_ids": " ".join(str(int(x)) for x in prediction_sequence),
+                        "is_exact_match": int(is_exact),
+                        "nonpad_token_accuracy": (
+                            sum(
+                                int(prediction == target)
+                                for prediction, target, keep in zip(prediction_sequence, target_sequence, nonpad_mask, strict=True)
+                                if keep
+                            )
+                            / max(sum(nonpad_mask), 1)
+                        ),
+                        "mean_nonpad_confidence": float(
+                            confidences[i][torch.tensor(nonpad_mask, dtype=torch.bool, device=confidences.device)].mean().item()
+                        )
+                        if any(nonpad_mask)
+                        else 0.0,
                     }
                 )
             offset += batch_size_now
@@ -604,7 +662,14 @@ def metrics_fieldnames(eval_split_names: list[str]) -> list[str]:
         "cuda_peak_reserved_mb",
     ]
     for split_name in eval_split_names:
-        for suffix in ["loss", "token_accuracy", "exact_match_accuracy", "output_1_accuracy", "output_2_accuracy"]:
+        for suffix in [
+            "loss",
+            "token_accuracy",
+            "exact_match_accuracy",
+            "target_0_accuracy",
+            "target_1_accuracy",
+            "nonpad_target_tokens",
+        ]:
             fieldnames.append(f"{split_name}_{suffix}")
     return fieldnames
 
@@ -651,6 +716,9 @@ def run_one(args: argparse.Namespace, *, layers: int, seed: int) -> dict[str, ob
             "num_species_tokens_including_null": metadata["num_species_tokens_including_null"],
             "num_amount_tokens": metadata["num_amount_tokens"],
             "target_design": metadata["target_design"],
+            "target_sequence_length": metadata.get("target_sequence_length"),
+            "pad_token": metadata.get("pad_token"),
+            "pad_token_id": metadata.get("pad_token_id"),
             "element_synthesis_fraction": metadata.get("element_synthesis_fraction"),
             "element_synthesis_rows": metadata.get("element_synthesis_rows"),
             "no_reaction_fraction": metadata.get("no_reaction_fraction"),
@@ -673,7 +741,15 @@ def run_one(args: argparse.Namespace, *, layers: int, seed: int) -> dict[str, ob
     vocab_size = int(metadata["vocab_size"])
     target_vocab_size = int(metadata["target_vocab_size"])
     seq_len = int(metadata["sequence_length"])
-    model = build_model(layers=layers, vocab_size=vocab_size, target_vocab_size=target_vocab_size, seq_len=seq_len).to(device)
+    target_seq_len = int(metadata["target_sequence_length"])
+    pad_token_id = int(metadata["pad_token_id"])
+    model = build_model(
+        layers=layers,
+        vocab_size=vocab_size,
+        target_vocab_size=target_vocab_size,
+        seq_len=seq_len,
+        target_seq_len=target_seq_len,
+    ).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr, weight_decay=config.weight_decay, betas=(0.9, 0.98))
     train_loader = make_loader(train_dataset, config.batch_size, shuffle=True)
     train_iterator = iter(train_loader)
@@ -687,6 +763,8 @@ def run_one(args: argparse.Namespace, *, layers: int, seed: int) -> dict[str, ob
                 "vocab_size": vocab_size,
                 "target_vocab_size": target_vocab_size,
                 "seq_len": seq_len,
+                "target_seq_len": target_seq_len,
+                "pad_token_id": pad_token_id,
             },
             "split_sizes": {"train": len(train_dataset), "val": len(val_dataset), "test": len(test_dataset)},
             "steps_per_epoch": steps_per_epoch,
@@ -726,7 +804,7 @@ def run_one(args: argparse.Namespace, *, layers: int, seed: int) -> dict[str, ob
             targets = targets.to(device)
             optimizer.zero_grad(set_to_none=True)
             logits = model(inputs)
-            loss = compute_loss(logits, targets)
+            loss = compute_loss(logits, targets, pad_token_id=pad_token_id)
             loss.backward()
             optimizer.step()
             train_loss = float(loss.item())
@@ -743,7 +821,7 @@ def run_one(args: argparse.Namespace, *, layers: int, seed: int) -> dict[str, ob
                 if step == 1 or step % config.eval_every == 0 or step == config.max_steps:
                     final_eval = {}
                     for split_name, dataset in eval_datasets_with_train.items():
-                        split_metrics = evaluate(model, dataset, device=device, batch_size=config.batch_size)
+                        split_metrics = evaluate(model, dataset, device=device, batch_size=config.batch_size, pad_token_id=pad_token_id)
                         final_eval[split_name] = split_metrics
                         for key, value in split_metrics.items():
                             record[f"{split_name}_{key}"] = value
@@ -792,9 +870,14 @@ def run_one(args: argparse.Namespace, *, layers: int, seed: int) -> dict[str, ob
     progress.close()
     if not final_eval:
         final_eval = {
-            split_name: evaluate(model, dataset, device=device, batch_size=config.batch_size)
+            split_name: evaluate(model, dataset, device=device, batch_size=config.batch_size, pad_token_id=pad_token_id)
             for split_name, dataset in eval_datasets_with_train.items()
         }
+    final_checkpoint_path = (
+        output_dir / "checkpoints" / f"step_{step:06d}.pt"
+        if should_checkpoint(config, step)
+        else output_dir / "final_checkpoint.pt"
+    )
     result = {
         "study_name": config.study_name,
         "seed": config.seed,
@@ -804,7 +887,7 @@ def run_one(args: argparse.Namespace, *, layers: int, seed: int) -> dict[str, ob
         "max_steps": config.max_steps,
         "completed_steps": step,
         "output_dir": str(output_dir),
-        "checkpoint_path": str(output_dir / "final_checkpoint.pt"),
+        "checkpoint_path": str(final_checkpoint_path),
         "train_size": len(train_dataset),
         "steps_per_epoch": steps_per_epoch,
         "parameter_count": parameter_count(model),
@@ -826,10 +909,24 @@ def run_one(args: argparse.Namespace, *, layers: int, seed: int) -> dict[str, ob
         train_loss=train_loss,
         eval_metrics=final_eval,
     )
-    export_prediction_table(output_dir / "train_predictions.csv", model, train_dataset, device=device, batch_size=config.batch_size)
+    export_prediction_table(
+        output_dir / "train_predictions.csv",
+        model,
+        train_dataset,
+        device=device,
+        batch_size=config.batch_size,
+        pad_token_id=pad_token_id,
+    )
     for split_name, dataset in eval_datasets.items():
-        export_prediction_table(output_dir / f"{split_name}_predictions.csv", model, dataset, device=device, batch_size=config.batch_size)
-    save_checkpoint(output_dir / "final_checkpoint.pt", model=model, optimizer=optimizer, step=step, result=result)
+        export_prediction_table(
+            output_dir / f"{split_name}_predictions.csv",
+            model,
+            dataset,
+            device=device,
+            batch_size=config.batch_size,
+            pad_token_id=pad_token_id,
+        )
+    save_checkpoint(final_checkpoint_path, model=model, optimizer=optimizer, step=step, result=result)
     return result
 
 
@@ -1086,7 +1183,12 @@ def main() -> None:
     print(f"Generating deterministic reaction dataset in {args.dataset_dir}")
     generate_dataset(args, args.dataset_dir)
     validation = validate_dataset(args.dataset_dir)
-    print(f"Validated {validation['row_count']} rows; species tokens={validation['species_token_count']}; amount tokens={validation['amount_token_count']}")
+    print(
+        f"Validated {validation['row_count']} rows; "
+        f"tokens={validation['token_count']}; "
+        f"unit tokens={validation['used_unit_token_count']}; "
+        f"amount tokens={validation['amount_token_count']}"
+    )
     jobs = build_jobs(args)
     write_manifest(args, jobs, args.dataset_dir, validation)
 
